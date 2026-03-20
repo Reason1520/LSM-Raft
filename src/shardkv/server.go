@@ -1,14 +1,18 @@
-package shardkv
+﻿package shardkv
 
 import (
 	"bytes"
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
+	"6.5840/lsm"
 	"6.5840/raft"
 	"6.5840/shardctrler"
 )
@@ -19,12 +23,11 @@ const (
 	GCInterval           = 100 * time.Millisecond
 )
 
-// 分片状态
 const (
-	Serving   = iota // 正常服务
-	Pulling          // 正在从其他组拉取数据
-	BePulling        // 正在被其他组拉取（即在此配置中不属于我，但数据还在我这）
-	GCing            // 等待清理
+	Serving   = iota // normal service
+	Pulling          // pulling shard data from other group
+	BePulling        // being pulled by other group (data still local)
+	GCing            // waiting for GC
 )
 
 type Op struct {
@@ -33,11 +36,11 @@ type Op struct {
 	Value     string
 	ClientID  int64
 	RPCID     int64
-	Config    shardctrler.Config   // 用于 Reconfig
-	ShardData map[string]string    // 用于 InsertShard
-	LastOpMap map[int64]OpResult   // 用于 InsertShard，携带去重信息
-	ShardID   int                  // 用于 DeleteShard/InsertShard
-	ConfigNum int                  // 用于 DeleteShard/InsertShard 校验配置版本
+	Config    shardctrler.Config
+	ShardData map[string]string
+	LastOpMap map[int64]OpResult
+	ShardID   int
+	ConfigNum int
 }
 
 type OpResult struct {
@@ -62,20 +65,14 @@ type ShardKV struct {
 	lastConfig   shardctrler.Config
 	persister	 *raft.Persister
 
-	// 核心数据存储: shardID -> key -> value
-	kvDB map[int]map[string]string
+	kvDB map[int]*lsm.LSMEngine
 
-	// 影子存储: configNum -> shardID -> key -> value
-	// 用于存储历史版本的数据，供其他组拉取
 	shadowDB map[int]map[int]map[string]string
 
-	// 分片状态: shardID -> status
 	shardStatus map[int]int
 
-	// 客户端去重: ClientID -> Last Op Result
 	lastOps map[int64]OpResult
 
-	// 通知 RPC 处理完成的 channel: Index -> Result Channel
 	waitCh map[int]chan OpResult
 }
 
@@ -128,7 +125,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = res.Err
 }
 
-// 统一处理 Op 的提交和等待
+// startOp submits an Op to Raft and waits for its result.
 func (kv *ShardKV) startOp(op Op) OpResult {
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
@@ -154,7 +151,7 @@ func (kv *ShardKV) startOp(op Op) OpResult {
 	}
 }
 
-// PullData RPC Handler: 其他组来拉取数据
+// PullData handles shard data pull requests from other groups.
 func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
@@ -165,12 +162,10 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 	defer kv.mu.Unlock()
 
 	if args.ConfigNum >= kv.config.Num {
-		// 请求者的配置比我还新，我还没准备好数据
 		reply.Err = ErrNotReady
 		return
 	}
 
-	// 从 shadowDB 中查找对应配置版本的数据
 	if shards, ok := kv.shadowDB[args.ConfigNum]; ok {
 		if shardData, ok := shards[args.ShardIndex]; ok {
 			// Deep Copy Data
@@ -188,11 +183,10 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 		}
 	}
 
-	// 如果找不到数据，可能是已经被 GC 了或者版本不对
 	reply.Err = ErrNoKey 
 }
 
-// DeleteShard RPC Handler: 别的组已经拿到了数据，通知我可以删除了
+// DeleteShard handles GC confirmation from the new owner.
 func (kv *ShardKV) DeleteShard(args *PullDataArgs, reply *PullDataReply) {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
@@ -200,8 +194,6 @@ func (kv *ShardKV) DeleteShard(args *PullDataArgs, reply *PullDataReply) {
 	}
 
 	kv.mu.Lock()
-	// 只有当本组配置已经前进到请求配置之后，才能安全删除旧分片影子数据。
-	// 否则不能返回 OK，否则对端会停止重试，导致 shadowDB 泄漏。
 	if args.ConfigNum >= kv.config.Num {
 		reply.Err = ErrNotReady
 		kv.mu.Unlock()
@@ -209,7 +201,6 @@ func (kv *ShardKV) DeleteShard(args *PullDataArgs, reply *PullDataReply) {
 	}
 	kv.mu.Unlock()
 
-	// 这个操作也需要走 Raft，保证一致性
 	op := Op{
 		Type:      DELETESHARD,
 		ConfigNum: args.ConfigNum,
@@ -220,7 +211,7 @@ func (kv *ShardKV) DeleteShard(args *PullDataArgs, reply *PullDataReply) {
 	reply.Err = res.Err
 }
 
-// Applier 协程: 处理 Raft ApplyMsg
+// applier handles committed Raft log entries and snapshots.
 func (kv *ShardKV) applier() {
 	for msg := range kv.applyCh {
 		if kv.killed() {
@@ -235,10 +226,9 @@ func (kv *ShardKV) applier() {
 			var res OpResult
 			res.RPCID = op.RPCID
 
-			// 处理不同类型的 Op
 			switch op.Type {
 			case PUT, APPEND:
-				res = kv.applyPutAppend(op)
+				res = kv.applyPutAppend(op, index)
 			case GET:
 				res = kv.applyGet(op)
 			case RECONFIG:
@@ -249,15 +239,11 @@ func (kv *ShardKV) applier() {
 				res = kv.applyDeleteShard(op)
 			}
 
-			// 检查是否需要 Snapshot
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
 				kv.snapshot(index)
 			}
 
-			// 通知等待的 RPC Handler
 			if ch, ok := kv.waitCh[index]; ok {
-				// 只有当 Op 里的 ClientID 和 RPCID 匹配时才算当前请求成功
-				// 但对于 Config/Migration 操作，通常不需要严格匹配 RPCID
 				ch <- res
 			}
 			kv.mu.Unlock()
@@ -269,27 +255,26 @@ func (kv *ShardKV) applier() {
 	}
 }
 
-// --- Applier Helper Functions (Must hold lock) ---
+// --- Applier helper functions (must hold lock) ---
 
-func (kv *ShardKV) applyPutAppend(op Op) OpResult {
+func (kv *ShardKV) applyPutAppend(op Op, index int) OpResult {
 	shard := key2shard(op.Key)
 	if !kv.canServe(shard) {
 		return OpResult{Err: ErrWrongGroup}
 	}
 
-	// 幂等性检查：RPCID 单调递增，旧请求和重试请求都不能重复执行。
 	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
 		return lastRes
 	}
 
-	if kv.kvDB[shard] == nil {
-		kv.kvDB[shard] = make(map[string]string)
-	}
-
+	engine := kv.ensureShardEngine(shard)
+	trancID := uint64(index)
 	if op.Type == PUT {
-		kv.kvDB[shard][op.Key] = op.Value
+		engine.Put(op.Key, encodeValue(op.Value), trancID)
 	} else {
-		kv.kvDB[shard][op.Key] += op.Value
+		curEnc, _ := engine.Get(op.Key, 0)
+		curVal, _ := decodeValue(curEnc)
+		engine.Put(op.Key, encodeValue(curVal+op.Value), trancID)
 	}
 
 	res := OpResult{Err: OK, RPCID: op.RPCID}
@@ -303,10 +288,13 @@ func (kv *ShardKV) applyGet(op Op) OpResult {
 		return OpResult{Err: ErrWrongGroup}
 	}
 
-	// Get 操作只读，不修改状态，但为了线性一致性，我们通常不缓存 Get 的结果给 LastOps
-	// 除非需要严格的一次性语义，但 Lab 中 Get 即使重复执行也没副作用
 	
-	val, ok := kv.kvDB[shard][op.Key]
+	engine := kv.kvDB[shard]
+	if engine == nil {
+		return OpResult{Err: ErrNoKey, RPCID: op.RPCID}
+	}
+	enc, _ := engine.Get(op.Key, 0)
+	val, ok := decodeValue(enc)
 	if !ok {
 		return OpResult{Err: ErrNoKey, RPCID: op.RPCID}
 	}
@@ -314,43 +302,33 @@ func (kv *ShardKV) applyGet(op Op) OpResult {
 }
 
 func (kv *ShardKV) applyReconfig(op Op) OpResult {
-	// 只有当 Config 序号递增时才更新
 	if op.Config.Num == kv.config.Num+1 {
-		// 1. 更新 Config
 		kv.lastConfig = kv.config
 		kv.config = op.Config
 
-		// 2. 更新分片状态
-		// 遍历所有分片 (0-9)
 		for i := 0; i < shardctrler.NShards; i++ {
-			// 如果新配置里这个分片归我
 			if kv.config.Shards[i] == kv.gid {
-				// 如果旧配置里不归我，说明是新增的，需要 Pull
-				// 唯一的特例是 config.Num = 1，初始状态，直接 Serving
 				if kv.lastConfig.Shards[i] != kv.gid && kv.lastConfig.Num != 0 {
 					kv.shardStatus[i] = Pulling
 				} else {
-					// 已经是我的或者初始分配，直接服务
 					kv.shardStatus[i] = Serving
-					if kv.kvDB[i] == nil {
-						kv.kvDB[i] = make(map[string]string)
-					}
+					kv.ensureShardEngine(i)
 				}
 			} else {
-				// 新配置里不归我
 				if kv.lastConfig.Shards[i] == kv.gid {
-					// 之前归我，现在不归我了 -> 移入 ShadowDB，等待别人来拉
 					kv.shardStatus[i] = BePulling
 					
 					if kv.shadowDB[kv.lastConfig.Num] == nil {
 						kv.shadowDB[kv.lastConfig.Num] = make(map[int]map[string]string)
 					}
-					// 移动数据，而不是复制，节省内存
-					kv.shadowDB[kv.lastConfig.Num][i] = kv.kvDB[i]
-					kv.kvDB[i] = nil // 清空当前 DB
+					if engine := kv.kvDB[i]; engine != nil {
+						kv.shadowDB[kv.lastConfig.Num][i] = kv.exportShardData(engine)
+						engine.Close()
+					} else {
+						kv.shadowDB[kv.lastConfig.Num][i] = make(map[string]string)
+					}
+					kv.kvDB[i] = nil // clear local DB
 				} else {
-					// 之前不归我，现在也不归我
-					// 保持原样 (可能还是 BePulling 或者无关)
 				}
 			}
 		}
@@ -359,23 +337,18 @@ func (kv *ShardKV) applyReconfig(op Op) OpResult {
 }
 
 func (kv *ShardKV) applyInsertShard(op Op) OpResult {
-	// 只有在 Pulling 状态且配置版本匹配时才接受数据
 	if op.ConfigNum == kv.config.Num && kv.shardStatus[op.ShardID] == Pulling {
-		// 1. 存入数据
-		kv.kvDB[op.ShardID] = make(map[string]string)
+		engine := kv.ensureShardEngine(op.ShardID)
 		for k, v := range op.ShardData {
-			kv.kvDB[op.ShardID][k] = v
+			engine.Put(k, encodeValue(v), 0)
 		}
 
-		// 2. 合并去重表 (Max Logic)
 		for clientId, otherRes := range op.LastOpMap {
 			if localRes, ok := kv.lastOps[clientId]; !ok || otherRes.RPCID > localRes.RPCID {
 				kv.lastOps[clientId] = otherRes
 			}
 		}
 
-		// 3. 状态变更为 GCing (意味着可以服务了，但需要通知对方删除)
-		// 为了简化，我们可以直接改为 Serving，并让后台协程去发送 DeleteShard
 		kv.shardStatus[op.ShardID] = GCing
 	}
 	return OpResult{Err: OK}
@@ -383,7 +356,6 @@ func (kv *ShardKV) applyInsertShard(op Op) OpResult {
 
 func (kv *ShardKV) applyDeleteShard(op Op) OpResult {
 	if op.ConfigNum < kv.config.Num {
-		// 删除旧配置产生的数据
 		if shards, ok := kv.shadowDB[op.ConfigNum]; ok {
 			delete(shards, op.ShardID)
 			if len(shards) == 0 {
@@ -394,16 +366,105 @@ func (kv *ShardKV) applyDeleteShard(op Op) OpResult {
 	return OpResult{Err: OK}
 }
 
-// --- Background Tasks ---
+// --- LSM helpers ---
 
-// 1. 监控配置更新
+const lsmValuePrefix byte = 0x01
+
+func encodeValue(v string) string {
+	b := make([]byte, 1+len(v))
+	b[0] = lsmValuePrefix
+	copy(b[1:], v)
+	return string(b)
+}
+
+func decodeValue(v string) (string, bool) {
+	if v == "" {
+		return "", false
+	}
+	if v[0] == lsmValuePrefix {
+		return v[1:], true
+	}
+	// fallback for legacy/unknown encoding
+	return v, true
+}
+
+func (kv *ShardKV) shardRootDir() string {
+	return filepath.Join(os.TempDir(), fmt.Sprintf("shardkv-%d-%d", kv.gid, kv.me))
+}
+
+func (kv *ShardKV) shardDir(shard int) string {
+	return filepath.Join(kv.shardRootDir(), fmt.Sprintf("shard-%d", shard))
+}
+
+func (kv *ShardKV) newShardEngine(shard int) *lsm.LSMEngine {
+	dir := kv.shardDir(shard)
+	_ = os.MkdirAll(dir, os.ModePerm)
+	return lsm.NewLSMEngine(dir)
+}
+
+func (kv *ShardKV) ensureShardEngine(shard int) *lsm.LSMEngine {
+	if kv.kvDB[shard] == nil {
+		kv.kvDB[shard] = kv.newShardEngine(shard)
+	}
+	return kv.kvDB[shard]
+}
+
+func (kv *ShardKV) exportShardData(engine *lsm.LSMEngine) map[string]string {
+	out := make(map[string]string)
+	if engine == nil {
+		return out
+	}
+	start, end, ok := engine.LsmItersMonotonyPredicate(0, func(string) int { return 0 })
+	if !ok || start == nil {
+		return out
+	}
+	defer start.Close()
+	if end != nil {
+		defer end.Close()
+	}
+	for start.Valid() {
+		k := start.Key()
+		v, ok := decodeValue(start.Value())
+		if ok {
+			out[k] = v
+		}
+		start.Next()
+	}
+	return out
+}
+
+func (kv *ShardKV) exportAllShards() map[int]map[string]string {
+	out := make(map[int]map[string]string)
+	for shard, engine := range kv.kvDB {
+		if engine != nil {
+			out[shard] = kv.exportShardData(engine)
+		}
+	}
+	return out
+}
+
+func (kv *ShardKV) restoreAllShards(snapshot map[int]map[string]string) {
+	for _, engine := range kv.kvDB {
+		if engine != nil {
+			engine.Close()
+		}
+	}
+	kv.kvDB = make(map[int]*lsm.LSMEngine)
+	for shard, data := range snapshot {
+		engine := kv.newShardEngine(shard)
+		for k, v := range data {
+			engine.Put(k, encodeValue(v), 0)
+		}
+		kv.kvDB[shard] = engine
+	}
+}
+
+// --- Background tasks ---
+
 func (kv *ShardKV) monitorConfig() {
 	for !kv.killed() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			kv.mu.Lock()
-			// 只有当迁移流程结束后才拉取新配置。
-			// 若在 GCing 时继续前进配置，会覆盖 lastConfig，导致后续 DeleteShard
-			// 可能发往错误的来源组/版本，造成 shadowDB 残留。
 			canNext := true
 			for _, status := range kv.shardStatus {
 				if status == Pulling || status == GCing {
@@ -415,10 +476,8 @@ func (kv *ShardKV) monitorConfig() {
 			kv.mu.Unlock()
 
 			if canNext {
-				// 查询下一个配置
 				nextConfig := kv.mck.Query(curNum + 1)
 				if nextConfig.Num == curNum+1 {
-					// 提交 Reconfig
 					kv.startOp(Op{
 						Type:   RECONFIG,
 						Config: nextConfig,
@@ -430,7 +489,6 @@ func (kv *ShardKV) monitorConfig() {
 	}
 }
 
-// 2. 监控分片拉取 (Pulling -> InsertShard)
 func (kv *ShardKV) monitorMigration() {
 	for !kv.killed() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
@@ -439,25 +497,22 @@ func (kv *ShardKV) monitorMigration() {
 			
 			for shardID, status := range kv.shardStatus {
 				if status == Pulling {
-					// 找到该分片在上一轮配置中的持有者
 					gid := kv.lastConfig.Shards[shardID]
 					servers := kv.lastConfig.Groups[gid]
-					configNum := kv.lastConfig.Num // 我们要拉取的是生成于 lastConfig 的数据
+					configNum := kv.lastConfig.Num // data produced under lastConfig
 					
 					wg.Add(1)
 					go func(sID, cNum int, gServers []string) {
 						defer wg.Done()
 						args := PullDataArgs{ConfigNum: cNum, ShardIndex: sID}
 						
-						// 轮询该组的所有服务器
 						for _, server := range gServers {
 							srv := kv.make_end(server)
 							var reply PullDataReply
 							if srv.Call("ShardKV.PullData", &args, &reply) && reply.Err == OK {
-								// 拉取成功，提交 Raft
 								kv.startOp(Op{
 									Type:      INSERTSHARD,
-									ConfigNum: kv.config.Num, // 这里的 ConfigNum 指当前我的配置
+									ConfigNum: kv.config.Num, // use current config number
 									ShardID:   sID,
 									ShardData: reply.ShardData,
 									LastOpMap: reply.LastOpMap,
@@ -475,7 +530,6 @@ func (kv *ShardKV) monitorMigration() {
 	}
 }
 
-// 3. 监控垃圾回收 (GCing -> DeleteShard -> Serving)
 func (kv *ShardKV) monitorGC() {
 	for !kv.killed() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
@@ -494,13 +548,9 @@ func (kv *ShardKV) monitorGC() {
 						args := PullDataArgs{ConfigNum: cNum, ShardIndex: sID}
 						var reply PullDataReply
 						
-						// 通知原持有者删除数据
 						for _, server := range gServers {
 							srv := kv.make_end(server)
 							if srv.Call("ShardKV.DeleteShard", &args, &reply) && reply.Err == OK {
-								// 对方删除成功后，我这里更新状态为 Serving
-								// 这里不需要走 Raft，因为 GCing -> Serving 只是本地状态变更，数据已经在 InsertShard 时写进去了
-								// 但为了安全起见，我们通常还是通过 Op 或者加锁直接改
 								kv.mu.Lock()
 								if kv.shardStatus[sID] == GCing {
 									kv.shardStatus[sID] = Serving
@@ -525,7 +575,8 @@ func (kv *ShardKV) snapshot(index int) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	
-	e.Encode(kv.kvDB)
+	kvdbSnapshot := kv.exportAllShards()
+	e.Encode(kvdbSnapshot)
 	e.Encode(kv.shadowDB)
 	e.Encode(kv.shardStatus)
 	e.Encode(kv.lastOps)
@@ -557,7 +608,7 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 		d.Decode(&lastConfig) != nil {
 		log.Fatal("ReadSnapshot decode error")
 	} else {
-		kv.kvDB = kvDB
+		kv.restoreAllShards(kvDB)
 		kv.shadowDB = shadowDB
 		kv.shardStatus = shardStatus
 		kv.lastOps = lastOps
@@ -596,14 +647,12 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
 	
-	kv.kvDB = make(map[int]map[string]string)
+	kv.kvDB = make(map[int]*lsm.LSMEngine)
 	kv.shadowDB = make(map[int]map[int]map[string]string)
 	kv.shardStatus = make(map[int]int)
 	kv.lastOps = make(map[int64]OpResult)
 	kv.waitCh = make(map[int]chan OpResult)
 
-	// 初始化所有分片状态为 Serving (默认 Config 0 不归属于任何组，但状态机初始为空)
-	// 实际逻辑由 config loop 驱动
 
 	kv.readSnapshot(persister.ReadSnapshot())
 
@@ -614,3 +663,4 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	return kv
 }
+
