@@ -18,6 +18,7 @@ const (
 	ErrTimeout     = "ErrTimeout"
 	ErrNotReady    = "ErrNotReady"
 	ErrConfigNotReady = "ErrConfigNotReady"
+	ErrConflict    = "ErrConflict"
 )
 
 const (
@@ -27,9 +28,20 @@ const (
 	RECONFIG = "Reconfig"
 	INSERTSHARD  = "InsertShard"
 	DELETESHARD  = "DeleteShard"
+	TXNCOMMIT    = "TxnCommit"
 )
 
 type Err string
+
+// IsolationLevel defines transaction isolation level.
+type IsolationLevel int
+
+const (
+	ReadUncommitted IsolationLevel = iota
+	ReadCommitted
+	RepeatableRead
+	Serializable
+)
 
 // PutAppendArgs : Put or Append arguments.
 type PutAppendArgs struct {
@@ -69,5 +81,55 @@ type PullDataReply struct {
     ShardData map[string]string
 	LastOpMap map[int64]OpResult
     Err   Err
+}
+
+// Transaction RPCs (single-shard).
+type TxnBeginArgs struct {
+	ClientID  int64
+	RPCID     int64
+	Isolation IsolationLevel
+}
+
+type TxnBeginReply struct {
+	Err      Err
+	TxnID    uint64
+	Snapshot uint64
+}
+
+type TxnGetArgs struct {
+	Key      string
+	Snapshot uint64
+	ClientID int64
+	RPCID    int64
+}
+
+type TxnGetReply struct {
+	Err     Err
+	Value   string
+	Version uint64
+}
+
+type TxnWrite struct {
+	Key    string
+	Value  string
+	Delete bool
+}
+
+type TxnRead struct {
+	Key     string
+	Version uint64
+}
+
+type TxnCommitArgs struct {
+	TxnID     uint64
+	ClientID  int64
+	RPCID     int64
+	Isolation IsolationLevel
+	Writes    []TxnWrite
+	Reads     []TxnRead
+}
+
+type TxnCommitReply struct {
+	Err Err
 }
 

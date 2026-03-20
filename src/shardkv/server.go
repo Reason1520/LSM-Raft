@@ -36,6 +36,10 @@ type Op struct {
 	Value     string
 	ClientID  int64
 	RPCID     int64
+	TxnID     uint64
+	Writes    []TxnWrite
+	Reads     []TxnRead
+	Isolation IsolationLevel
 	Config    shardctrler.Config
 	ShardData map[string]string
 	LastOpMap map[int64]OpResult
@@ -74,6 +78,9 @@ type ShardKV struct {
 	lastOps map[int64]OpResult
 
 	waitCh map[int]chan OpResult
+
+	nextTxnID  uint64
+	lastApplied int
 }
 
 // Check strictly if I can serve this key
@@ -119,6 +126,107 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		Value:    args.Value,
 		ClientID: args.ClientID,
 		RPCID:    args.RPCID,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnBegin(args *TxnBeginArgs, reply *TxnBeginReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	txnID := atomic.AddUint64(&kv.nextTxnID, 1)
+
+	kv.mu.Lock()
+	snapshot := kv.lastApplied
+	kv.mu.Unlock()
+
+	reply.Err = OK
+	reply.TxnID = txnID
+	reply.Snapshot = uint64(snapshot)
+}
+
+func (kv *ShardKV) TxnGet(args *TxnGetArgs, reply *TxnGetReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	shard := key2shard(args.Key)
+	kv.mu.Lock()
+	if !kv.canServe(shard) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	engine := kv.kvDB[shard]
+	kv.mu.Unlock()
+
+	if engine == nil {
+		reply.Err = ErrNoKey
+		reply.Version = 0
+		return
+	}
+
+	enc, tid := engine.Get(args.Key, args.Snapshot)
+	val, ok := decodeValue(enc)
+	reply.Version = tid
+	if !ok {
+		reply.Err = ErrNoKey
+		return
+	}
+	reply.Err = OK
+	reply.Value = val
+}
+
+func (kv *ShardKV) TxnCommit(args *TxnCommitArgs, reply *TxnCommitReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	shard := -1
+	for _, w := range args.Writes {
+		s := key2shard(w.Key)
+		if shard == -1 {
+			shard = s
+		} else if shard != s {
+			reply.Err = ErrWrongGroup
+			return
+		}
+	}
+	for _, r := range args.Reads {
+		s := key2shard(r.Key)
+		if shard == -1 {
+			shard = s
+		} else if shard != s {
+			reply.Err = ErrWrongGroup
+			return
+		}
+	}
+
+	if shard != -1 {
+		kv.mu.Lock()
+		if !kv.canServe(shard) {
+			reply.Err = ErrWrongGroup
+			kv.mu.Unlock()
+			return
+		}
+		kv.mu.Unlock()
+	}
+
+	op := Op{
+		Type:      TXNCOMMIT,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		TxnID:     args.TxnID,
+		Writes:    args.Writes,
+		Reads:     args.Reads,
+		Isolation: args.Isolation,
+		ShardID:   shard,
 	}
 
 	res := kv.startOp(op)
@@ -237,11 +345,15 @@ func (kv *ShardKV) applier() {
 				res = kv.applyInsertShard(op)
 			case DELETESHARD:
 				res = kv.applyDeleteShard(op)
+			case TXNCOMMIT:
+				res = kv.applyTxnCommit(op, index)
 			}
 
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
 				kv.snapshot(index)
 			}
+
+			kv.lastApplied = index
 
 			if ch, ok := kv.waitCh[index]; ok {
 				ch <- res
@@ -250,6 +362,7 @@ func (kv *ShardKV) applier() {
 		} else if msg.SnapshotValid {
 			kv.mu.Lock()
 			kv.readSnapshot(msg.Snapshot)
+			kv.lastApplied = msg.SnapshotIndex
 			kv.mu.Unlock()
 		}
 	}
@@ -364,6 +477,69 @@ func (kv *ShardKV) applyDeleteShard(op Op) OpResult {
 		}
 	}
 	return OpResult{Err: OK}
+}
+
+func (kv *ShardKV) applyTxnCommit(op Op, index int) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+
+	if op.ShardID != -1 && !kv.canServe(op.ShardID) {
+		return OpResult{Err: ErrWrongGroup, RPCID: op.RPCID}
+	}
+
+	shard := op.ShardID
+	for _, w := range op.Writes {
+		s := key2shard(w.Key)
+		if shard == -1 {
+			shard = s
+		} else if shard != s {
+			return OpResult{Err: ErrWrongGroup, RPCID: op.RPCID}
+		}
+	}
+	for _, r := range op.Reads {
+		s := key2shard(r.Key)
+		if shard == -1 {
+			shard = s
+		} else if shard != s {
+			return OpResult{Err: ErrWrongGroup, RPCID: op.RPCID}
+		}
+	}
+
+	if shard == -1 {
+		res := OpResult{Err: OK, RPCID: op.RPCID}
+		kv.lastOps[op.ClientID] = res
+		return res
+	}
+
+	engine := kv.kvDB[shard]
+	if engine == nil {
+		return OpResult{Err: ErrNoKey, RPCID: op.RPCID}
+	}
+
+	if op.Isolation == RepeatableRead || op.Isolation == Serializable {
+		for _, r := range op.Reads {
+			_, tid := engine.Get(r.Key, 0)
+			if tid != r.Version {
+				res := OpResult{Err: ErrConflict, RPCID: op.RPCID}
+				kv.lastOps[op.ClientID] = res
+				return res
+			}
+		}
+	}
+
+	trancID := uint64(index)
+	for _, w := range op.Writes {
+		if w.Delete {
+			engine.Remove(w.Key, trancID)
+		} else {
+			engine.Put(w.Key, encodeValue(w.Value), trancID)
+		}
+	}
+
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
 }
 
 // --- LSM helpers ---
@@ -634,6 +810,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(OpResult{})
 	labgob.Register(map[string]string{})
 	labgob.Register(map[int64]OpResult{})
+	labgob.Register(TxnWrite{})
+	labgob.Register(TxnRead{})
+	labgob.Register([]TxnWrite{})
+	labgob.Register([]TxnRead{})
 
 	kv := new(ShardKV)
 	kv.me = me

@@ -435,8 +435,8 @@ func (lsme *LSMEngine) FullCompact(srclevel uint16) {
 		lxIDs = append(lxIDs, iter.Value.(uint16))
 	}
 	lyIDs := make([]uint16, 0)
-	if  srclevel + 1 <= lsme.curMaxLevel {
-		for iter := lsme.levelSSTID[srclevel + 1].Front(); iter != nil; iter = iter.Next() {
+	if srclevel+1 <= lsme.curMaxLevel && lsme.levelSSTID[srclevel+1] != nil {
+		for iter := lsme.levelSSTID[srclevel+1].Front(); iter != nil; iter = iter.Next() {
 			lyIDs = append(lyIDs, iter.Value.(uint16))
 		}
 	}
