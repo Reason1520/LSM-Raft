@@ -398,6 +398,7 @@ func (kv *ShardKV) shardDir(shard int) string {
 
 func (kv *ShardKV) newShardEngine(shard int) *lsm.LSMEngine {
 	dir := kv.shardDir(shard)
+	_ = os.RemoveAll(dir)
 	_ = os.MkdirAll(dir, os.ModePerm)
 	return lsm.NewLSMEngine(dir)
 }
