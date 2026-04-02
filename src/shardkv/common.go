@@ -10,25 +10,27 @@ package shardkv
 //
 
 const (
-	OK             = "OK"
-	ErrNoKey       = "ErrNoKey"
-	ErrWrongGroup  = "ErrWrongGroup"
-	ErrWrongLeader = "ErrWrongLeader"
-	ErrRepeated    = "ErrRepeated"
-	ErrTimeout     = "ErrTimeout"
-	ErrNotReady    = "ErrNotReady"
+	OK                = "OK"
+	ErrNoKey          = "ErrNoKey"
+	ErrWrongGroup     = "ErrWrongGroup"
+	ErrWrongLeader    = "ErrWrongLeader"
+	ErrRepeated       = "ErrRepeated"
+	ErrTimeout        = "ErrTimeout"
+	ErrNotReady       = "ErrNotReady"
 	ErrConfigNotReady = "ErrConfigNotReady"
-	ErrConflict    = "ErrConflict"
+	ErrConflict       = "ErrConflict"
 )
 
 const (
-	GET    = "Get"
-	PUT    = "Put"
-	APPEND = "Append"
-	RECONFIG = "Reconfig"
-	INSERTSHARD  = "InsertShard"
-	DELETESHARD  = "DeleteShard"
-	TXNCOMMIT    = "TxnCommit"
+	GET         = "Get"
+	PUT         = "Put"
+	APPEND      = "Append"
+	RANGE       = "Range"
+	RECONFIG    = "Reconfig"
+	INSERTSHARD = "InsertShard"
+	DELETESHARD = "DeleteShard"
+	TXNCOMMIT   = "TxnCommit"
+	TXNBEGIN    = "TxnBegin"
 )
 
 type Err string
@@ -53,7 +55,7 @@ type PutAppendArgs struct {
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
 	ClientID int64
-	RPCID int64
+	RPCID    int64
 }
 
 type PutAppendReply struct {
@@ -64,7 +66,7 @@ type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
 	ClientID int64
-	RPCID int64
+	RPCID    int64
 }
 
 type GetReply struct {
@@ -72,15 +74,34 @@ type GetReply struct {
 	Value string
 }
 
+type KeyValue struct {
+	Key   string
+	Value string
+}
+
+type RangeArgs struct {
+	Start    string
+	End      string // empty means open-ended
+	Limit    int    // 0 means no limit
+	ShardID  int    // target shard
+	ClientID int64
+	RPCID    int64
+}
+
+type RangeReply struct {
+	Err Err
+	KVs []KeyValue
+}
+
 type PullDataArgs struct {
-	ConfigNum int	// 请求者想获得的配置版本
-	ShardIndex int	// 请求者想获得的分片索引
+	ConfigNum  int // 请求者想获得的配置版本
+	ShardIndex int // 请求者想获得的分片索引
 }
 
 type PullDataReply struct {
-    ShardData map[string]string
+	ShardData map[string]string
 	LastOpMap map[int64]OpResult
-    Err   Err
+	Err       Err
 }
 
 // Transaction RPCs (single-shard).
@@ -99,6 +120,7 @@ type TxnBeginReply struct {
 type TxnGetArgs struct {
 	Key      string
 	Snapshot uint64
+	TxnID    uint64
 	ClientID int64
 	RPCID    int64
 }
@@ -133,3 +155,24 @@ type TxnCommitReply struct {
 	Err Err
 }
 
+type TxnRangeArgs struct {
+	Start    string
+	End      string
+	Limit    int
+	ShardID  int
+	Snapshot uint64
+	TxnID    uint64
+	ClientID int64
+	RPCID    int64
+}
+
+type TxnRangeKV struct {
+	Key     string
+	Value   string
+	Version uint64
+}
+
+type TxnRangeReply struct {
+	Err Err
+	KVs []TxnRangeKV
+}

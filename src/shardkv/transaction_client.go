@@ -1,6 +1,9 @@
 package shardkv
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // Txn is a client-side single-shard transaction.
 type Txn struct {
@@ -58,7 +61,7 @@ func (tx *Txn) Get(key string) (string, bool) {
 		}
 		return *v, true
 	}
-	val, ver, err := tx.ck.txnGetOnShard(tx.shard, key, tx.snapshot)
+	val, ver, err := tx.ck.txnGetOnShard(tx.shard, key, tx.snapshot, tx.txnID)
 	if err == OK {
 		tx.reads[key] = ver
 		return val, true
@@ -92,6 +95,69 @@ func (tx *Txn) Remove(key string) bool {
 	}
 	tx.writes[key] = nil
 	return true
+}
+
+// Range reads a range within the transaction snapshot.
+func (tx *Txn) Range(start, end string, limit int) ([]KeyValue, bool) {
+	if tx.invalid {
+		return nil, false
+	}
+	if !tx.ensureBegin(start) {
+		return nil, false
+	}
+	if end != "" && key2shard(end) != tx.shard {
+		tx.invalid = true
+		return nil, false
+	}
+
+	kvs, err := tx.ck.txnRangeOnShard(tx.shard, start, end, limit, tx.snapshot, tx.txnID)
+	if err != OK && err != ErrNoKey {
+		return nil, false
+	}
+
+	// record read versions for keys not overwritten by writes
+	for _, kv := range kvs {
+		if _, hasWrite := tx.writes[kv.Key]; !hasWrite {
+			tx.reads[kv.Key] = kv.Version
+		}
+	}
+
+	// build base map from read results
+	base := make(map[string]string, len(kvs))
+	for _, kv := range kvs {
+		base[kv.Key] = kv.Value
+	}
+
+	// overlay writes within range
+	inRange := func(k string) bool {
+		if k < start {
+			return false
+		}
+		if end != "" && k >= end {
+			return false
+		}
+		return true
+	}
+	for k, v := range tx.writes {
+		if !inRange(k) {
+			continue
+		}
+		if v == nil {
+			delete(base, k)
+		} else {
+			base[k] = *v
+		}
+	}
+
+	out := make([]KeyValue, 0, len(base))
+	for k, v := range base {
+		out = append(out, KeyValue{Key: k, Value: v})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out, true
 }
 
 // Commit submits the transaction as a single Raft log entry.
@@ -168,10 +234,11 @@ func (ck *Clerk) txnBeginOnShard(shard int, level IsolationLevel) (uint64, uint6
 	}
 }
 
-func (ck *Clerk) txnGetOnShard(shard int, key string, snapshot uint64) (string, uint64, Err) {
+func (ck *Clerk) txnGetOnShard(shard int, key string, snapshot uint64, txnID uint64) (string, uint64, Err) {
 	args := TxnGetArgs{
 		Key:      key,
 		Snapshot: snapshot,
+		TxnID:    txnID,
 		ClientID: ck.ClientID,
 		RPCID:    ck.allocRPCID(),
 	}
@@ -205,6 +272,37 @@ func (ck *Clerk) txnCommitOnShard(shard int, args *TxnCommitArgs) Err {
 				ok := srv.Call("ShardKV.TxnCommit", args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrConflict) {
 					return reply.Err
+				}
+				if ok && reply.Err == ErrWrongGroup {
+					break
+				}
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+		ck.config = ck.sm.Query(-1)
+	}
+}
+
+func (ck *Clerk) txnRangeOnShard(shard int, start, end string, limit int, snapshot uint64, txnID uint64) ([]TxnRangeKV, Err) {
+	args := TxnRangeArgs{
+		Start:    start,
+		End:      end,
+		Limit:    limit,
+		ShardID:  shard,
+		Snapshot: snapshot,
+		TxnID:    txnID,
+		ClientID: ck.ClientID,
+		RPCID:    ck.allocRPCID(),
+	}
+	for {
+		gid := ck.config.Shards[shard]
+		if servers, ok := ck.config.Groups[gid]; ok {
+			for si := 0; si < len(servers); si++ {
+				srv := ck.makeEnd(servers[si])
+				var reply TxnRangeReply
+				ok := srv.Call("ShardKV.TxnRange", &args, &reply)
+				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
+					return reply.KVs, reply.Err
 				}
 				if ok && reply.Err == ErrWrongGroup {
 					break

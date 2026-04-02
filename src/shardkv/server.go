@@ -1,4 +1,4 @@
-﻿package shardkv
+package shardkv
 
 import (
 	"bytes"
@@ -21,6 +21,8 @@ const (
 	UpConfigLoopInterval = 100 * time.Millisecond
 	GetShardsInterval    = 100 * time.Millisecond
 	GCInterval           = 100 * time.Millisecond
+	TxnGCInterval        = 500 * time.Millisecond
+	TxnTTL               = 30 * time.Second
 )
 
 const (
@@ -31,25 +33,29 @@ const (
 )
 
 type Op struct {
-	Type      string // "Get", "Put", "Append", "Reconfig", "InsertShard", "DeleteShard"
-	Key       string
-	Value     string
-	ClientID  int64
-	RPCID     int64
-	TxnID     uint64
-	Writes    []TxnWrite
-	Reads     []TxnRead
-	Isolation IsolationLevel
-	Config    shardctrler.Config
-	ShardData map[string]string
-	LastOpMap map[int64]OpResult
-	ShardID   int
-	ConfigNum int
+	Type       string // "Get", "Put", "Append", "Reconfig", "InsertShard", "DeleteShard"
+	Key        string
+	Value      string
+	RangeStart string
+	RangeEnd   string
+	RangeLimit int
+	ClientID   int64
+	RPCID      int64
+	TxnID      uint64
+	Writes     []TxnWrite
+	Reads      []TxnRead
+	Isolation  IsolationLevel
+	Config     shardctrler.Config
+	ShardData  map[string]string
+	LastOpMap  map[int64]OpResult
+	ShardID    int
+	ConfigNum  int
 }
 
 type OpResult struct {
 	Err   Err
 	Value string
+	KVs   []KeyValue
 	RPCID int64
 }
 
@@ -64,10 +70,10 @@ type ShardKV struct {
 	maxraftstate int // snapshot if log grows this big
 	dead         int32
 
-	mck          *shardctrler.Clerk
-	config       shardctrler.Config
-	lastConfig   shardctrler.Config
-	persister	 *raft.Persister
+	mck        *shardctrler.Clerk
+	config     shardctrler.Config
+	lastConfig shardctrler.Config
+	persister  *raft.Persister
 
 	kvDB map[int]*lsm.LSMEngine
 
@@ -79,8 +85,12 @@ type ShardKV struct {
 
 	waitCh map[int]chan OpResult
 
-	nextTxnID  uint64
+	nextTxnID   uint64
 	lastApplied int
+
+	activeTxn     map[uint64]uint64
+	activeTxnLast map[uint64]time.Time
+	gcWatermark   uint64
 }
 
 // Check strictly if I can serve this key
@@ -108,6 +118,31 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	res := kv.startOp(op)
 	reply.Err = res.Err
 	reply.Value = res.Value
+}
+
+func (kv *ShardKV) Range(args *RangeArgs, reply *RangeReply) {
+	shard := args.ShardID
+	kv.mu.Lock()
+	if !kv.canServe(shard) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	kv.mu.Unlock()
+
+	op := Op{
+		Type:       RANGE,
+		RangeStart: args.Start,
+		RangeEnd:   args.End,
+		RangeLimit: args.Limit,
+		ShardID:    args.ShardID,
+		ClientID:   args.ClientID,
+		RPCID:      args.RPCID,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+	reply.KVs = res.KVs
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -138,15 +173,44 @@ func (kv *ShardKV) TxnBegin(args *TxnBeginArgs, reply *TxnBeginReply) {
 		return
 	}
 
-	txnID := atomic.AddUint64(&kv.nextTxnID, 1)
+	op := Op{
+		Type:     TXNBEGIN,
+		ClientID: args.ClientID,
+		RPCID:    args.RPCID,
+	}
+	index, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
 
 	kv.mu.Lock()
-	snapshot := kv.lastApplied
+	ch := make(chan OpResult, 1)
+	kv.waitCh[index] = ch
 	kv.mu.Unlock()
 
-	reply.Err = OK
-	reply.TxnID = txnID
-	reply.Snapshot = uint64(snapshot)
+	defer func() {
+		kv.mu.Lock()
+		delete(kv.waitCh, index)
+		kv.mu.Unlock()
+	}()
+
+	select {
+	case res := <-ch:
+		if res.Err != OK {
+			reply.Err = res.Err
+			return
+		}
+		txnID := atomic.AddUint64(&kv.nextTxnID, 1)
+		reply.Err = OK
+		reply.TxnID = txnID
+		reply.Snapshot = uint64(index)
+		kv.mu.Lock()
+		kv.registerTxnLocked(txnID, reply.Snapshot)
+		kv.mu.Unlock()
+	case <-time.After(500 * time.Millisecond):
+		reply.Err = ErrTimeout
+	}
 }
 
 func (kv *ShardKV) TxnGet(args *TxnGetArgs, reply *TxnGetReply) {
@@ -162,6 +226,7 @@ func (kv *ShardKV) TxnGet(args *TxnGetArgs, reply *TxnGetReply) {
 		kv.mu.Unlock()
 		return
 	}
+	kv.touchTxnLocked(args.TxnID)
 	engine := kv.kvDB[shard]
 	kv.mu.Unlock()
 
@@ -233,6 +298,80 @@ func (kv *ShardKV) TxnCommit(args *TxnCommitArgs, reply *TxnCommitReply) {
 	reply.Err = res.Err
 }
 
+func (kv *ShardKV) TxnRange(args *TxnRangeArgs, reply *TxnRangeReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	shard := args.ShardID
+	kv.mu.Lock()
+	if !kv.canServe(shard) {
+		reply.Err = ErrWrongGroup
+		kv.mu.Unlock()
+		return
+	}
+	kv.touchTxnLocked(args.TxnID)
+	engine := kv.kvDB[shard]
+	kv.mu.Unlock()
+
+	if engine == nil {
+		reply.Err = OK
+		reply.KVs = nil
+		return
+	}
+
+	start := args.Start
+	end := args.End
+	limit := args.Limit
+	if limit < 0 {
+		limit = 0
+	}
+
+	pred := func(k string) int {
+		if k < start {
+			return 1
+		}
+		if end != "" && k >= end {
+			return -1
+		}
+		return 0
+	}
+
+	startIt, endIt, ok := engine.LsmItersMonotonyPredicate(args.Snapshot, pred)
+	if !ok || startIt == nil {
+		reply.Err = OK
+		reply.KVs = nil
+		return
+	}
+	defer startIt.Close()
+	if endIt != nil {
+		defer endIt.Close()
+	}
+
+	out := make([]TxnRangeKV, 0)
+	for startIt.Valid() {
+		k := startIt.Key()
+		if pred(k) != 0 {
+			break
+		}
+		if v, ok := decodeValue(startIt.Value()); ok {
+			out = append(out, TxnRangeKV{
+				Key:     k,
+				Value:   v,
+				Version: startIt.TrancID(),
+			})
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+		startIt.Next()
+	}
+
+	reply.Err = OK
+	reply.KVs = out
+}
+
 // startOp submits an Op to Raft and waits for its result.
 func (kv *ShardKV) startOp(op Op) OpResult {
 	index, _, isLeader := kv.rf.Start(op)
@@ -291,7 +430,7 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 		}
 	}
 
-	reply.Err = ErrNoKey 
+	reply.Err = ErrNoKey
 }
 
 // DeleteShard handles GC confirmation from the new owner.
@@ -339,6 +478,10 @@ func (kv *ShardKV) applier() {
 				res = kv.applyPutAppend(op, index)
 			case GET:
 				res = kv.applyGet(op)
+			case RANGE:
+				res = kv.applyRange(op, index)
+			case TXNBEGIN:
+				res = OpResult{Err: OK, RPCID: op.RPCID}
 			case RECONFIG:
 				res = kv.applyReconfig(op)
 			case INSERTSHARD:
@@ -354,6 +497,7 @@ func (kv *ShardKV) applier() {
 			}
 
 			kv.lastApplied = index
+			kv.updateGCWatermarkLocked()
 
 			if ch, ok := kv.waitCh[index]; ok {
 				ch <- res
@@ -363,6 +507,7 @@ func (kv *ShardKV) applier() {
 			kv.mu.Lock()
 			kv.readSnapshot(msg.Snapshot)
 			kv.lastApplied = msg.SnapshotIndex
+			kv.updateGCWatermarkLocked()
 			kv.mu.Unlock()
 		}
 	}
@@ -401,7 +546,6 @@ func (kv *ShardKV) applyGet(op Op) OpResult {
 		return OpResult{Err: ErrWrongGroup}
 	}
 
-	
 	engine := kv.kvDB[shard]
 	if engine == nil {
 		return OpResult{Err: ErrNoKey, RPCID: op.RPCID}
@@ -412,6 +556,71 @@ func (kv *ShardKV) applyGet(op Op) OpResult {
 		return OpResult{Err: ErrNoKey, RPCID: op.RPCID}
 	}
 	return OpResult{Err: OK, Value: val, RPCID: op.RPCID}
+}
+
+func (kv *ShardKV) applyRange(op Op, index int) OpResult {
+	start := op.RangeStart
+	end := op.RangeEnd
+	limit := op.RangeLimit
+	if limit < 0 {
+		limit = 0
+	}
+
+	shard := op.ShardID
+	if !kv.canServe(shard) {
+		return OpResult{Err: ErrWrongGroup, RPCID: op.RPCID}
+	}
+
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+
+	engine := kv.kvDB[shard]
+	if engine == nil {
+		res := OpResult{Err: OK, RPCID: op.RPCID, KVs: nil}
+		kv.lastOps[op.ClientID] = res
+		return res
+	}
+
+	pred := func(k string) int {
+		if k < start {
+			return 1
+		}
+		if end != "" && k >= end {
+			return -1
+		}
+		return 0
+	}
+
+	startIt, endIt, ok := engine.LsmItersMonotonyPredicate(uint64(index), pred)
+	if !ok || startIt == nil {
+		res := OpResult{Err: OK, RPCID: op.RPCID, KVs: nil}
+		kv.lastOps[op.ClientID] = res
+		return res
+	}
+	defer startIt.Close()
+	if endIt != nil {
+		defer endIt.Close()
+	}
+
+	out := make([]KeyValue, 0)
+	for startIt.Valid() {
+		k := startIt.Key()
+		if pred(k) != 0 {
+			break
+		}
+		if v, ok := decodeValue(startIt.Value()); ok {
+			out = append(out, KeyValue{Key: k, Value: v})
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+		startIt.Next()
+	}
+
+	res := OpResult{Err: OK, RPCID: op.RPCID, KVs: out}
+	kv.lastOps[op.ClientID] = res
+	return res
 }
 
 func (kv *ShardKV) applyReconfig(op Op) OpResult {
@@ -430,7 +639,7 @@ func (kv *ShardKV) applyReconfig(op Op) OpResult {
 			} else {
 				if kv.lastConfig.Shards[i] == kv.gid {
 					kv.shardStatus[i] = BePulling
-					
+
 					if kv.shadowDB[kv.lastConfig.Num] == nil {
 						kv.shadowDB[kv.lastConfig.Num] = make(map[int]map[string]string)
 					}
@@ -480,6 +689,7 @@ func (kv *ShardKV) applyDeleteShard(op Op) OpResult {
 }
 
 func (kv *ShardKV) applyTxnCommit(op Op, index int) OpResult {
+	defer kv.unregisterTxnLocked(op.TxnID)
 	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
 		return lastRes
 	}
@@ -542,6 +752,80 @@ func (kv *ShardKV) applyTxnCommit(op Op, index int) OpResult {
 	return res
 }
 
+// --- MVCC GC helpers (must hold lock) ---
+
+func (kv *ShardKV) registerTxnLocked(txnID uint64, snapshot uint64) {
+	if txnID == 0 {
+		return
+	}
+	kv.activeTxn[txnID] = snapshot
+	kv.activeTxnLast[txnID] = time.Now()
+	kv.updateGCWatermarkLocked()
+}
+
+func (kv *ShardKV) touchTxnLocked(txnID uint64) {
+	if txnID == 0 {
+		return
+	}
+	if _, ok := kv.activeTxn[txnID]; ok {
+		kv.activeTxnLast[txnID] = time.Now()
+	}
+}
+
+func (kv *ShardKV) unregisterTxnLocked(txnID uint64) {
+	if txnID == 0 {
+		return
+	}
+	if _, ok := kv.activeTxn[txnID]; ok {
+		delete(kv.activeTxn, txnID)
+		delete(kv.activeTxnLast, txnID)
+		kv.updateGCWatermarkLocked()
+	}
+}
+
+func (kv *ShardKV) updateGCWatermarkLocked() {
+	minSnap := uint64(kv.lastApplied)
+	if len(kv.activeTxn) > 0 {
+		minSnap = ^uint64(0)
+		for _, s := range kv.activeTxn {
+			if s < minSnap {
+				minSnap = s
+			}
+		}
+	}
+	if minSnap == kv.gcWatermark {
+		return
+	}
+	kv.gcWatermark = minSnap
+	for _, engine := range kv.kvDB {
+		if engine != nil {
+			engine.SetGCWatermark(minSnap)
+		}
+	}
+}
+
+func (kv *ShardKV) monitorTxnGC() {
+	for !kv.killed() {
+		time.Sleep(TxnGCInterval)
+		kv.mu.Lock()
+		if len(kv.activeTxnLast) > 0 {
+			now := time.Now()
+			changed := false
+			for id, ts := range kv.activeTxnLast {
+				if now.Sub(ts) > TxnTTL {
+					delete(kv.activeTxnLast, id)
+					delete(kv.activeTxn, id)
+					changed = true
+				}
+			}
+			if changed {
+				kv.updateGCWatermarkLocked()
+			}
+		}
+		kv.mu.Unlock()
+	}
+}
+
 // --- LSM helpers ---
 
 const lsmValuePrefix byte = 0x01
@@ -576,7 +860,9 @@ func (kv *ShardKV) newShardEngine(shard int) *lsm.LSMEngine {
 	dir := kv.shardDir(shard)
 	_ = os.RemoveAll(dir)
 	_ = os.MkdirAll(dir, os.ModePerm)
-	return lsm.NewLSMEngine(dir)
+	engine := lsm.NewLSMEngine(dir)
+	engine.SetGCWatermark(kv.gcWatermark)
+	return engine
 }
 
 func (kv *ShardKV) ensureShardEngine(shard int) *lsm.LSMEngine {
@@ -671,18 +957,18 @@ func (kv *ShardKV) monitorMigration() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			kv.mu.Lock()
 			var wg sync.WaitGroup
-			
+
 			for shardID, status := range kv.shardStatus {
 				if status == Pulling {
 					gid := kv.lastConfig.Shards[shardID]
 					servers := kv.lastConfig.Groups[gid]
 					configNum := kv.lastConfig.Num // data produced under lastConfig
-					
+
 					wg.Add(1)
 					go func(sID, cNum int, gServers []string) {
 						defer wg.Done()
 						args := PullDataArgs{ConfigNum: cNum, ShardIndex: sID}
-						
+
 						for _, server := range gServers {
 							srv := kv.make_end(server)
 							var reply PullDataReply
@@ -712,19 +998,19 @@ func (kv *ShardKV) monitorGC() {
 		if _, isLeader := kv.rf.GetState(); isLeader {
 			kv.mu.Lock()
 			var wg sync.WaitGroup
-			
+
 			for shardID, status := range kv.shardStatus {
 				if status == GCing {
 					gid := kv.lastConfig.Shards[shardID]
 					servers := kv.lastConfig.Groups[gid]
 					configNum := kv.lastConfig.Num
-					
+
 					wg.Add(1)
 					go func(sID, cNum int, gServers []string) {
 						defer wg.Done()
 						args := PullDataArgs{ConfigNum: cNum, ShardIndex: sID}
 						var reply PullDataReply
-						
+
 						for _, server := range gServers {
 							srv := kv.make_end(server)
 							if srv.Call("ShardKV.DeleteShard", &args, &reply) && reply.Err == OK {
@@ -751,7 +1037,7 @@ func (kv *ShardKV) monitorGC() {
 func (kv *ShardKV) snapshot(index int) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	
+
 	kvdbSnapshot := kv.exportAllShards()
 	e.Encode(kvdbSnapshot)
 	e.Encode(kv.shadowDB)
@@ -759,7 +1045,7 @@ func (kv *ShardKV) snapshot(index int) {
 	e.Encode(kv.lastOps)
 	e.Encode(kv.config)
 	e.Encode(kv.lastConfig)
-	
+
 	kv.rf.Snapshot(index, w.Bytes())
 }
 
@@ -769,14 +1055,14 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	
+
 	var kvDB map[int]map[string]string
 	var shadowDB map[int]map[int]map[string]string
 	var shardStatus map[int]int
 	var lastOps map[int64]OpResult
 	var config shardctrler.Config
 	var lastConfig shardctrler.Config
-	
+
 	if d.Decode(&kvDB) != nil ||
 		d.Decode(&shadowDB) != nil ||
 		d.Decode(&shardStatus) != nil ||
@@ -814,6 +1100,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(TxnRead{})
 	labgob.Register([]TxnWrite{})
 	labgob.Register([]TxnRead{})
+	labgob.Register(KeyValue{})
+	labgob.Register([]KeyValue{})
+	labgob.Register(TxnRangeKV{})
+	labgob.Register([]TxnRangeKV{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -825,15 +1115,16 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
-	
+
 	kv.mck = shardctrler.MakeClerk(kv.ctrlers)
-	
+
 	kv.kvDB = make(map[int]*lsm.LSMEngine)
 	kv.shadowDB = make(map[int]map[int]map[string]string)
 	kv.shardStatus = make(map[int]int)
 	kv.lastOps = make(map[int64]OpResult)
 	kv.waitCh = make(map[int]chan OpResult)
-
+	kv.activeTxn = make(map[uint64]uint64)
+	kv.activeTxnLast = make(map[uint64]time.Time)
 
 	kv.readSnapshot(persister.ReadSnapshot())
 
@@ -841,7 +1132,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.monitorConfig()
 	go kv.monitorMigration()
 	go kv.monitorGC()
+	go kv.monitorTxnGC()
 
 	return kv
 }
-

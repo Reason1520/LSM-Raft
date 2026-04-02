@@ -55,6 +55,8 @@ type LSMEngine struct {
 	closing     bool                  // 是否处于关闭流程中
 	compactCh   chan struct{}         // 合并触发通道（合并信号合并）
 	compactStop chan struct{}         // 合并线程退出信号
+	gcMu        sync.RWMutex          // 保护 gcWatermark
+	gcWatermark uint64                // MVCC GC 水位
 }
 
 func NewLSMEngine(dataDir string) *LSMEngine {
@@ -168,6 +170,21 @@ func NewLSMEngine(dataDir string) *LSMEngine {
 // SetMemtableMaxSize sets the memtable size threshold before freezing.
 func (lsme *LSMEngine) SetMemtableMaxSize(bytes int) {
 	lsme.memtable.SetMaxTableSize(bytes)
+}
+
+// SetGCWatermark sets the minimum snapshot that must remain visible.
+// GC will drop versions strictly below this watermark, keeping one fallback version per key.
+func (lsme *LSMEngine) SetGCWatermark(w uint64) {
+	lsme.gcMu.Lock()
+	lsme.gcWatermark = w
+	lsme.gcMu.Unlock()
+}
+
+func (lsme *LSMEngine) getGCWatermark() uint64 {
+	lsme.gcMu.RLock()
+	w := lsme.gcWatermark
+	lsme.gcMu.RUnlock()
+	return w
 }
 
 // Put: 插入数据
@@ -356,30 +373,67 @@ func (lsm *LSMEngine) GetSSTSize(level uint16) int {
 
 // GenSSTFromIter: 从一个迭代器中构造新的SST
 func (lsme *LSMEngine) GenSSTFromIter(baseit Iterator, targetsize int, targetlevel uint16) []*SSTable {
+	return lsme.GenSSTFromIterWithGC(baseit, targetsize, targetlevel, 0)
+}
+
+// GenSSTFromIterWithGC builds SSTs from an iterator with MVCC GC.
+// It keeps all versions with trancID >= gcWatermark, plus one version below gcWatermark.
+func (lsme *LSMEngine) GenSSTFromIterWithGC(baseit Iterator, targetsize int, targetlevel uint16, gcWatermark uint64) []*SSTable {
 	// 新的SST
 	var res []*SSTable
 	bloomfilter := NewBloomFilter(BLOOM_FILTER_EXPECTED_SIZE, BLOOM_FILTER_EXPECTED_ERROR_RATE)
 	builder := NewSSTBuilder(BLOCK_CAPACITY, bloomfilter, lsme.blockCache, true)
 	curSize := 0
+	curKey := ""
+	keptBelow := false
+	var lastKey, lastVal string
+	var lastTid uint64
+	haveLast := false
 
 	for baseit.Valid() {
 		key := baseit.Key()
 		value := baseit.Value()
 		trancID := baseit.TrancID()
-		builder.Add(key, value, trancID)
 
-		curSize += len(key) + len(value)
-		// 如果满足大小超过targetsize，则构造一个SST
-		if curSize >= targetsize {
-			id := lsme.allocSSTID()
-			path := fmt.Sprintf("%s/sst_%032d.%d", lsme.dataDir, id, targetlevel)
-			sst := builder.Build(id, path)
-			res = append(res, sst)
-
-			bloomfilter = NewBloomFilter(BLOOM_FILTER_EXPECTED_SIZE, BLOOM_FILTER_EXPECTED_ERROR_RATE)
-			builder = NewSSTBuilder(BLOCK_CAPACITY, bloomfilter, lsme.blockCache, true)
-			curSize = 0
+		if key != curKey {
+			curKey = key
+			keptBelow = false
 		}
+
+		if haveLast && key == lastKey && trancID == lastTid && value == lastVal {
+			baseit.Next()
+			continue
+		}
+
+		emit := false
+		if gcWatermark == 0 || trancID >= gcWatermark {
+			emit = true
+		} else if !keptBelow {
+			emit = true
+		}
+
+		if emit {
+			builder.Add(key, value, trancID)
+			if gcWatermark != 0 && trancID < gcWatermark {
+				keptBelow = true
+			}
+			lastKey, lastVal, lastTid = key, value, trancID
+			haveLast = true
+
+			curSize += len(key) + len(value)
+			// 如果满足大小超过targetsize，则构造一个SST
+			if curSize >= targetsize {
+				id := lsme.allocSSTID()
+				path := fmt.Sprintf("%s/sst_%032d.%d", lsme.dataDir, id, targetlevel)
+				sst := builder.Build(id, path)
+				res = append(res, sst)
+
+				bloomfilter = NewBloomFilter(BLOOM_FILTER_EXPECTED_SIZE, BLOOM_FILTER_EXPECTED_ERROR_RATE)
+				builder = NewSSTBuilder(BLOCK_CAPACITY, bloomfilter, lsme.blockCache, true)
+				curSize = 0
+			}
+		}
+
 		baseit.Next()
 	}
 	if curSize > 0 {
@@ -395,8 +449,8 @@ func (lsme *LSMEngine) GenSSTFromIter(baseit Iterator, targetsize int, targetlev
 // Fulll0l1Compact: 将L0层和L1层的SST合并到L1层
 func (lsme *LSMEngine) Full0l1Compact(l0IDs []uint16, l1IDs []uint16) []*SSTable {
 	// todo trancID后面再改
-	// L0 迭代器
-	var l0iters []Iterator
+	// L0/L1 迭代器（保留所有版本）
+	var iters []Iterator
 	var l0ssts []*SSTable
 	var l1ssts []*SSTable
 	lsme.SSTsMutex.RLock()
@@ -412,49 +466,39 @@ func (lsme *LSMEngine) Full0l1Compact(l0IDs []uint16, l1IDs []uint16) []*SSTable
 	}
 	lsme.SSTsMutex.RUnlock()
 
-	for _, l0sst := range l0ssts {
-		l0iters = append(l0iters, NewSSTIterator(l0sst, 0))
+	for _, sst := range l0ssts {
+		iters = append(iters, NewSSTIterator(sst, 0))
 	}
-
-	l0Iter := NewHeapIterator(l0iters, false, 0)
-
-	// L1 迭代器
-	l1Iter := NewConcactIterator(l1ssts, 0)
-
-	// merge
-	mergeIter := NewTwoMergeIterator(l0Iter, l1Iter, 0)
+	for _, sst := range l1ssts {
+		iters = append(iters, NewSSTIterator(sst, 0))
+	}
+	mergeIter := NewVersionedHeapIterator(iters, 0)
 
 	targetSize := lsme.GetSSTSize(1)
 
-	return lsme.GenSSTFromIter(mergeIter, targetSize, 1)
+	return lsme.GenSSTFromIterWithGC(mergeIter, targetSize, 1, lsme.getGCWatermark())
 }
 
 // FullCommonCompact: 负责其他相邻Level的SST合并
 func (lsm *LSMEngine) FullCommonCompact(lxIDs []uint16, lyIDs []uint16, levelY uint16) []*SSTable {
-	var sstX []*SSTable
+	var iters []Iterator
 	lsm.SSTsMutex.RLock()
 	for _, id := range lxIDs {
 		if sst, ok := lsm.SSTs[id]; ok && sst != nil {
-			sstX = append(sstX, sst)
+			iters = append(iters, NewSSTIterator(sst, 0))
 		}
 	}
-
-	var sstY []*SSTable
 	for _, id := range lyIDs {
 		if sst, ok := lsm.SSTs[id]; ok && sst != nil {
-			sstY = append(sstY, sst)
+			iters = append(iters, NewSSTIterator(sst, 0))
 		}
 	}
 	lsm.SSTsMutex.RUnlock()
 
-	iterX := NewConcactIterator(sstX, 0)
-	iterY := NewConcactIterator(sstY, 0)
-
-	merge := NewTwoMergeIterator(iterX, iterY, 0)
-
+	merge := NewVersionedHeapIterator(iters, 0)
 	targetSize := lsm.GetSSTSize(levelY)
 
-	return lsm.GenSSTFromIter(merge, targetSize, levelY)
+	return lsm.GenSSTFromIterWithGC(merge, targetSize, levelY, lsm.getGCWatermark())
 }
 
 // FullCompact: 指定层级的所有 SSTable 压缩到下一层级

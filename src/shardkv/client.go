@@ -12,6 +12,7 @@ import "6.5840/labrpc"
 import "crypto/rand"
 import "math/big"
 import "6.5840/shardctrler"
+import "sort"
 import "sync/atomic"
 import "time"
 
@@ -36,11 +37,11 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm       *shardctrler.Clerk
-	config   shardctrler.Config
+	sm      *shardctrler.Clerk
+	config  shardctrler.Config
 	makeEnd func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
-	ClientID int64
+	ClientID  int64
 	nextRPCID int64
 }
 
@@ -142,4 +143,74 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+// Range returns key/value pairs in [start, end) within the shard of start.
+// end == "" means open-ended. limit == 0 means no limit.
+func (ck *Clerk) Range(start, end string, limit int) []KeyValue {
+	for {
+		cfg := ck.config
+		perShardRPC := make([]int64, shardctrler.NShards)
+		for i := 0; i < shardctrler.NShards; i++ {
+			perShardRPC[i] = ck.allocRPCID()
+		}
+
+		all := make([]KeyValue, 0)
+		needRefresh := false
+
+		for shard := 0; shard < shardctrler.NShards; shard++ {
+			gid := cfg.Shards[shard]
+			servers, ok := cfg.Groups[gid]
+			if !ok || gid == 0 || len(servers) == 0 {
+				needRefresh = true
+				break
+			}
+
+			args := RangeArgs{
+				Start:    start,
+				End:      end,
+				Limit:    0, // global limit will be applied after merge
+				ShardID:  shard,
+				ClientID: ck.ClientID,
+				RPCID:    perShardRPC[shard],
+			}
+
+			got := false
+			for si := 0; si < len(servers); si++ {
+				srv := ck.makeEnd(servers[si])
+				var reply RangeReply
+				ok := srv.Call("ShardKV.Range", &args, &reply)
+				if ok && (reply.Err == OK || reply.Err == ErrNoKey || reply.Err == ErrRepeated) {
+					all = append(all, reply.KVs...)
+					got = true
+					break
+				}
+				if ok && reply.Err == ErrWrongGroup {
+					needRefresh = true
+					break
+				}
+			}
+
+			if needRefresh {
+				break
+			}
+			if !got {
+				needRefresh = true
+				break
+			}
+		}
+
+		if !needRefresh {
+			sort.Slice(all, func(i, j int) bool {
+				return all[i].Key < all[j].Key
+			})
+			if limit > 0 && len(all) > limit {
+				all = all[:limit]
+			}
+			return all
+		}
+
+		time.Sleep(100 * time.Millisecond)
+		ck.config = ck.sm.Query(-1)
+	}
 }
