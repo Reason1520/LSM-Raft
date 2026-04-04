@@ -1,0 +1,19 @@
+syntax = "proto3";
+
+package labrpcpb;
+
+option go_package = "6.5840/labrpcpb";
+
+service LabRPC {
+  rpc Call(CallRequest) returns (CallReply);
+}
+
+message CallRequest {
+  string svc_meth = 1;
+  bytes args = 2;
+}
+
+message CallReply {
+  bool ok = 1;
+  bytes reply = 2;
+}

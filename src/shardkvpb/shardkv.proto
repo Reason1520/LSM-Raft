@@ -1,0 +1,123 @@
+syntax = "proto3";
+
+package shardkvpb;
+
+option go_package = "6.5840/shardkvpb";
+
+service ShardKV {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Append(AppendRequest) returns (AppendResponse);
+  rpc Range(RangeRequest) returns (RangeResponse);
+
+  rpc TxnBegin(TxnBeginRequest) returns (TxnBeginResponse);
+  rpc TxnGet(TxnGetRequest) returns (TxnGetResponse);
+  rpc TxnRange(TxnRangeRequest) returns (TxnRangeResponse);
+  rpc TxnCommit(TxnCommitRequest) returns (TxnCommitResponse);
+}
+
+message KeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+message TxnRangeKV {
+  string key = 1;
+  string value = 2;
+  uint64 version = 3;
+}
+
+message TxnWrite {
+  string key = 1;
+  string value = 2;
+  bool delete = 3;
+}
+
+message TxnRead {
+  string key = 1;
+  uint64 version = 2;
+}
+
+enum IsolationLevel {
+  READ_UNCOMMITTED = 0;
+  READ_COMMITTED = 1;
+  REPEATABLE_READ = 2;
+  SERIALIZABLE = 3;
+}
+
+message GetRequest {
+  string key = 1;
+}
+message GetResponse {
+  string err = 1;
+  string value = 2;
+}
+
+message PutRequest {
+  string key = 1;
+  string value = 2;
+}
+message PutResponse {
+  string err = 1;
+}
+
+message AppendRequest {
+  string key = 1;
+  string value = 2;
+}
+message AppendResponse {
+  string err = 1;
+}
+
+message RangeRequest {
+  string start = 1;
+  string end = 2;
+  int32 limit = 3;
+}
+message RangeResponse {
+  string err = 1;
+  repeated KeyValue kvs = 2;
+}
+
+message TxnBeginRequest {
+  IsolationLevel isolation = 1;
+  string key_hint = 2;
+}
+message TxnBeginResponse {
+  string err = 1;
+  uint64 txn_id = 2;
+  uint64 snapshot = 3;
+}
+
+message TxnGetRequest {
+  string key = 1;
+  uint64 snapshot = 2;
+  uint64 txn_id = 3;
+}
+message TxnGetResponse {
+  string err = 1;
+  string value = 2;
+  uint64 version = 3;
+}
+
+message TxnRangeRequest {
+  string start = 1;
+  string end = 2;
+  int32 limit = 3;
+  uint64 snapshot = 4;
+  uint64 txn_id = 5;
+}
+message TxnRangeResponse {
+  string err = 1;
+  repeated TxnRangeKV kvs = 2;
+}
+
+message TxnCommitRequest {
+  uint64 txn_id = 1;
+  IsolationLevel isolation = 2;
+  repeated TxnWrite writes = 4;
+  repeated TxnRead reads = 5;
+}
+message TxnCommitResponse {
+  string err = 1;
+}

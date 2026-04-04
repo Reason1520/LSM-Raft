@@ -49,15 +49,21 @@ package labrpc
 //   pass svc to srv.AddService()
 //
 
-import "6.5840/labgob"
-import "bytes"
-import "reflect"
-import "sync"
-import "log"
-import "strings"
-import "math/rand"
-import "time"
-import "sync/atomic"
+import (
+	"bytes"
+	"context"
+	"log"
+	"math/rand"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"6.5840/labgob"
+	"6.5840/labrpcpb"
+	"google.golang.org/grpc"
+)
 
 type reqMsg struct {
 	endname  interface{} // name of sending ClientEnd
@@ -73,15 +79,24 @@ type replyMsg struct {
 }
 
 type ClientEnd struct {
-	endname interface{}   // this end-point's name
-	ch      chan reqMsg   // copy of Network.endCh
-	done    chan struct{} // closed when Network is cleaned up
+	endname    interface{}   // this end-point's name
+	ch         chan reqMsg   // copy of Network.endCh
+	done       chan struct{} // closed when Network is cleaned up
+	grpcClient interface {
+		Call(ctx context.Context, in *labrpcpb.CallRequest, opts ...grpc.CallOption) (*labrpcpb.CallReply, error)
+	}
+	grpcConn   *grpc.ClientConn
+	grpcTarget string
+	timeout    time.Duration
 }
 
 // send an RPC, wait for the reply.
 // the return value indicates success; false means that
 // no reply was received from the server.
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
+	if e.grpcClient != nil {
+		return e.grpcCall(svcMeth, args, reply)
+	}
 	req := reqMsg{}
 	req.endname = e.endname
 	req.svcMeth = svcMeth
@@ -120,6 +135,45 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 	} else {
 		return false
 	}
+}
+
+func (e *ClientEnd) grpcCall(svcMeth string, args interface{}, reply interface{}) bool {
+	req := reqMsg{}
+	req.svcMeth = svcMeth
+	qb := new(bytes.Buffer)
+	qe := labgob.NewEncoder(qb)
+	if err := qe.Encode(args); err != nil {
+		panic(err)
+	}
+
+	ctx := context.Background()
+	if e.timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, e.timeout)
+		defer cancel()
+	}
+
+	resp, err := e.grpcClient.Call(ctx, &labrpcpb.CallRequest{
+		SvcMeth: svcMeth,
+		Args:    qb.Bytes(),
+	})
+	if err != nil || resp == nil || !resp.Ok {
+		return false
+	}
+	rb := bytes.NewBuffer(resp.Reply)
+	rd := labgob.NewDecoder(rb)
+	if err := rd.Decode(reply); err != nil {
+		log.Fatalf("ClientEnd.grpcCall(): decode reply: %v\n", err)
+	}
+	return true
+}
+
+// Close closes the grpc connection if present.
+func (e *ClientEnd) Close() error {
+	if e.grpcConn != nil {
+		return e.grpcConn.Close()
+	}
+	return nil
 }
 
 type Network struct {
@@ -489,7 +543,11 @@ func (svc *Service) dispatch(methname string, req reqMsg) replyMsg {
 	if method, ok := svc.methods[methname]; ok {
 		// prepare space into which to read the argument.
 		// the Value's type will be a pointer to req.argsType.
-		args := reflect.New(req.argsType)
+		argType := req.argsType
+		if argType == nil {
+			argType = method.Type.In(1)
+		}
+		args := reflect.New(argType)
 
 		// decode the argument.
 		ab := bytes.NewBuffer(req.args)

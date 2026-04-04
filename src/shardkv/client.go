@@ -29,6 +29,11 @@ func key2shard(key string) int {
 	return shard
 }
 
+// Key2ShardForExternal exposes shard mapping for external clients (gRPC wrapper).
+func Key2ShardForExternal(key string) int {
+	return key2shard(key)
+}
+
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -73,6 +78,12 @@ func (ck *Clerk) allocRPCID() int64 {
 // You will have to modify this function.
 
 func (ck *Clerk) Get(key string) string {
+	val, _ := ck.GetWithErr(key)
+	return val
+}
+
+// GetWithErr returns value and Err, distinguishing ErrNoKey from OK.
+func (ck *Clerk) GetWithErr(key string) (string, Err) {
 	args := GetArgs{}
 	args.Key = key
 	args.ClientID = ck.ClientID
@@ -88,7 +99,7 @@ func (ck *Clerk) Get(key string) string {
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey || reply.Err == ErrRepeated) {
-					return reply.Value
+					return reply.Value, reply.Err
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
 					break
@@ -101,7 +112,7 @@ func (ck *Clerk) Get(key string) string {
 		ck.config = ck.sm.Query(-1)
 	}
 
-	return ""
+	return "", ErrTimeout
 }
 
 // shared by Put and Append.
