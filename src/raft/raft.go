@@ -752,6 +752,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	})
 	rf.persist(false, nil)
 
+	// Single-node cluster: commit immediately.
+	if len(rf.peers) == 1 {
+		rf.commitIndex = index
+		rf.applyCond.Broadcast()
+	}
+
 	// 立即发送心跳
 	rf.broadcastAppendEntries(true) 
 
@@ -774,6 +780,7 @@ func (rf *Raft) startElection() {
 	
 	rf.role = CANDIDATE
 	rf.currentTerm++
+	benchLogf("[raft] %d startElection term=%d peers=%d", rf.me, rf.currentTerm, len(rf.peers))
 	rf.votedFor = rf.me
 	rf.electionTimer = time.Now()
 	rf.persist(false, nil)
@@ -789,6 +796,23 @@ func (rf *Raft) startElection() {
 
 	var voteCount int32 = 1 // 投给自己
 	rf.mu.Unlock()
+
+	// Single-node cluster (or self-vote already has majority).
+	// Promote immediately without waiting for RPCs.
+	if int(voteCount) > len(rf.peers)/2 {
+		rf.mu.Lock()
+		if rf.role == CANDIDATE && rf.currentTerm == args.Term {
+			rf.role = LEADER
+			if PRINTINF {fmt.Printf("server %d become leader, its term is %d\n", rf.me, rf.currentTerm)}
+			for i := range rf.peers {
+				rf.nextIndex[i] = lastLogIndex + 1
+				rf.matchIndex[i] = 0
+			}
+			rf.broadcastAppendEntries(true)
+		}
+		rf.mu.Unlock()
+		return
+	}
 
 	for i := range rf.peers {
 		if i == rf.me {
@@ -818,6 +842,7 @@ func (rf *Raft) startElection() {
 					if int(atomic.LoadInt32(&voteCount)) > len(rf.peers)/2 {
 						if rf.role == CANDIDATE {
 							rf.role = LEADER
+				benchLogf("[raft] %d become leader (self-vote) term=%d peers=%d", rf.me, rf.currentTerm, len(rf.peers))
 							if PRINTINF {fmt.Printf("server %d become leader, its term is %d\n", rf.me, rf.currentTerm)}
 							// 初始化领导者状态
 							for i := range rf.peers {
@@ -895,6 +920,7 @@ func (rf *Raft) ticker() {
 			rf.mu.Lock()
 			timeout := time.Duration(300 + rand.Intn(300)) * time.Millisecond
 			if time.Since(rf.electionTimer) > timeout {
+			benchLogf("[raft] %d election timeout: startElection (term=%d peers=%d)", rf.me, rf.currentTerm, len(rf.peers))
 				// 启动选举
 				go rf.startElection()
 				rf.electionTimer = time.Now()

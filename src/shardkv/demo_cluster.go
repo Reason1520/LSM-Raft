@@ -4,6 +4,7 @@ import (
 	crand "crypto/rand"
 	"encoding/base64"
 	"fmt"
+	"os"
 	"time"
 
 	"6.5840/labrpc"
@@ -23,6 +24,16 @@ type DemoCluster struct {
 	groupN         int
 	groupServers   []*ShardKV
 	groupPersister []*raft.Persister
+}
+
+func demoLogf(format string, args ...interface{}) {
+	if os.Getenv("BENCH_DEBUG") != "1" {
+		return
+	}
+	fmt.Fprintf(os.Stderr, format, args...)
+	if len(format) == 0 || format[len(format)-1] != '\n' {
+		fmt.Fprint(os.Stderr, "\n")
+	}
 }
 
 func demoRandString(n int) string {
@@ -47,6 +58,7 @@ func StartDemoCluster(groupN int) (*DemoCluster, *Clerk) {
 		groupN = 1
 	}
 
+	demoLogf("[demo] init: make network")
 	dc := &DemoCluster{
 		net:            labrpc.MakeNetwork(),
 		groupGID:       1001,
@@ -55,11 +67,13 @@ func StartDemoCluster(groupN int) (*DemoCluster, *Clerk) {
 		groupPersister: make([]*raft.Persister, groupN),
 	}
 	dc.net.Reliable(true)
+	demoLogf("[demo] init: network ready")
 
 	// shardctrler (single replica for demo)
 	dc.ctrlerNames = []string{demoCtrlerName(0)}
 	dc.ctrlerServers = make([]*shardctrler.ShardCtrler, 1)
 	{
+		demoLogf("[demo] init: start shardctrler")
 		ends := make([]*labrpc.ClientEnd, 1)
 		endname := demoRandString(20)
 		ends[0] = dc.net.MakeEnd(endname)
@@ -75,10 +89,12 @@ func StartDemoCluster(groupN int) (*DemoCluster, *Clerk) {
 		srv.AddService(msvc)
 		srv.AddService(rfsvc)
 		dc.net.AddServer(dc.ctrlerNames[0], srv)
+		demoLogf("[demo] init: shardctrler ready")
 	}
 
 	// shardkv group
 	for i := 0; i < dc.groupN; i++ {
+		demoLogf("[demo] init: start shardkv server %d", i)
 		// ends to other shardkv servers in group
 		ends := make([]*labrpc.ClientEnd, dc.groupN)
 		for j := 0; j < dc.groupN; j++ {
@@ -118,10 +134,12 @@ func StartDemoCluster(groupN int) (*DemoCluster, *Clerk) {
 		srv.AddService(kvsvc)
 		srv.AddService(rfsvc)
 		dc.net.AddServer(demoServerName(dc.groupGID, i), srv)
+		demoLogf("[demo] init: shardkv server %d ready", i)
 	}
 
 	// join group to shardctrler
 	{
+		demoLogf("[demo] init: shardctrler join")
 		ends := make([]*labrpc.ClientEnd, 1)
 		endname := demoRandString(20)
 		ends[0] = dc.net.MakeEnd(endname)
@@ -137,6 +155,7 @@ func StartDemoCluster(groupN int) (*DemoCluster, *Clerk) {
 				return names
 			}(),
 		})
+		demoLogf("[demo] init: shardctrler join done")
 	}
 
 	// create shardkv client
@@ -157,7 +176,9 @@ func StartDemoCluster(groupN int) (*DemoCluster, *Clerk) {
 	})
 
 	// allow config to propagate
+	demoLogf("[demo] init: wait for config")
 	time.Sleep(200 * time.Millisecond)
+	demoLogf("[demo] init: ready")
 	return dc, ck
 }
 

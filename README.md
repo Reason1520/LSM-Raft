@@ -100,6 +100,33 @@ go test ./lsm/tests -v
 go test ./lsm -v
 ```
 
+## 基准测试与日志控制
+基准测试示例（仅跑 Benchmark，不跑单元测试）：
+```bash
+go test ./shardkv -run ^$ -bench BenchmarkShardKVPut -benchtime=15s -v -count=1
+```
+
+日志开关（环境变量）：
+- `BENCH_PROGRESS=1`：输出基准测试进度/QPS（默认 5s 一次）
+- `BENCH_DEBUG=1`：输出更详细的调试日志（Raft/ShardCtrler/labrpc 等）
+
+示例：
+```bash
+BENCH_PROGRESS=1 go test ./shardkv -run ^$ -bench BenchmarkShardKVPut -benchtime=15s -v -count=1
+BENCH_DEBUG=1 go test ./shardkv -run ^$ -bench BenchmarkShardKVPut -benchtime=15s -v -count=1
+```
+
+更多 Benchmark 示例：
+```bash
+# ShardKV（内部 labrpc）
+go test ./shardkv -run ^$ -bench BenchmarkShardKVPut -benchtime=15s -v -count=1
+go test ./shardkv -run ^$ -bench BenchmarkShardKVGet -benchtime=15s -v -count=1
+go test ./shardkv -run ^$ -bench BenchmarkShardKVRange -benchtime=15s -v -count=1
+
+# gRPC 对外客户端（Put+Get 混合）
+go test ./shardkv -run ^$ -bench BenchmarkGRPCPutGet -benchtime=15s -v -count=1
+```
+
 ## 备注
 - 测试仍基于 `labrpc`（网络可控），但已支持 gRPC 传输作为内部 RPC
 - 真正跨进程部署时，使用 gRPC 传输启动各节点即可

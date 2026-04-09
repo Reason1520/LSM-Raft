@@ -21,7 +21,7 @@ type ShardCtrler struct {
 
 	configs []Config 					// indexed by config num
 	LastOp map[int64]OpResult			// 记录最后一次操作结果
-	notifyChans map[int]chan OpResult	// 用来接收结果
+	notifyChans map[opKey]chan OpResult	// 用来接收结果
 }
 
 
@@ -53,45 +53,62 @@ type OpResult struct {
 	Term int
 }
 
+type opKey struct {
+	ClientID int64
+	RPCID    int64
+}
+
 // 封装统一的日志提交和等待逻辑
 func (sc *ShardCtrler) waitForApplied(op Op) OpResult {
-	// 提交到 Raft
-	index, term, isLeader :=sc.rf.Start(op)
+	// ??? Raft
+	benchLogf("[ctrler] waitForApplied start: type=%s client=%d rpc=%d", op.Type, op.ClientID, op.RPCID)
+	key := opKey{ClientID: op.ClientID, RPCID: op.RPCID}
+
+	// ??????????????? apply ??????
+	sc.mu.Lock()
+	ch := make(chan OpResult, 1)
+	sc.notifyChans[key] = ch
+	sc.mu.Unlock()
+
+	index, term, isLeader := sc.rf.Start(op)
+	benchLogf("[ctrler] Start: idx=%d term=%d leader=%v", index, term, isLeader)
 	if !isLeader {
-		// 如果当前节点不是leader
+		benchLogf("[ctrler] Start not leader: type=%s client=%d rpc=%d", op.Type, op.ClientID, op.RPCID)
+		// ????????leader
+		sc.mu.Lock()
+		delete(sc.notifyChans, key)
+		sc.mu.Unlock()
 		return OpResult{WrongLeader: true}
 	}
 
-	// 创建接收通道
-	sc.mu.Lock()
-	ch := make(chan OpResult, 1)
-	sc.notifyChans[index] = ch
-	sc.mu.Unlock()
-
-	// 确保退出时清理 channel
+	// ??????? channel
 	defer func() {
 		sc.mu.Lock()
-		delete(sc.notifyChans, index)
+		delete(sc.notifyChans, key)
 		sc.mu.Unlock()
 	}()
 
-	// 等待结果
+	// ????
 	select {
 	case res := <-ch:
-		// 校验当前 index 执行的命令是否是当前 RPC 提交的命令
-		// 如果 Term 变了，或者 ClientID/RPCID 不匹配，说明 Log 在该 index 被覆盖了
+		benchLogf("[ctrler] applied: idx=%d type=%s client=%d rpc=%d term=%d resTerm=%d err=%v", index, op.Type, op.ClientID, op.RPCID, term, res.Term, res.Err)
+		// ???? index ?????????? RPC ?????
+		// ?? Term ????? ClientID/RPCID ?????? Log ?? index ????
 		if res.Term != term || res.ClientID != op.ClientID || res.RPCID != op.RPCID {
+			benchLogf("[ctrler] applied mismatch: idx=%d type=%s client=%d rpc=%d term=%d resTerm=%d resClient=%d resRPC=%d", index, op.Type, op.ClientID, op.RPCID, term, res.Term, res.ClientID, res.RPCID)
 			return OpResult{WrongLeader: true}
 		}
 		return res
 	case <-time.After(500 * time.Millisecond):
-		// 超时
+		benchLogf("[ctrler] waitForApplied timeout: idx=%d type=%s client=%d rpc=%d", index, op.Type, op.ClientID, op.RPCID)
+		// ??
 		return OpResult{Err: ErrTimeout}
 	}
 }
 
 func (sc *ShardCtrler) Join(args *JoinArgs, reply *JoinReply) {
 	// Your code here.
+	benchLogf("[ctrler] Join called: client=%d rpc=%d servers=%d", args.ClientID, args.RPCID, len(args.Servers))
 	// 创建操作
 	op := Op{
 		Type: JOIN,
@@ -371,6 +388,7 @@ func (sc *ShardCtrler) applier() {
 
 			// 默认结果
 			op := applyMsg.Command.(Op)
+			benchLogf("[ctrler] apply: idx=%d type=%s client=%d rpc=%d", applyMsg.CommandIndex, op.Type, op.ClientID, op.RPCID)
 			var opRes OpResult
 			opRes.ClientID = op.ClientID
 			opRes.RPCID = op.RPCID
@@ -398,7 +416,8 @@ func (sc *ShardCtrler) applier() {
 			}
 
 			// 通知等待的 RPC
-			if ch, ok := sc.notifyChans[applyMsg.CommandIndex]; ok {
+			key := opKey{ClientID: op.ClientID, RPCID: op.RPCID}
+			if ch, ok := sc.notifyChans[key]; ok {
 				// 非阻塞发送，防止死锁
 				select {
 				case ch <- opRes:
@@ -424,7 +443,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 
 	// Your code here.
 	sc.LastOp = make(map[int64]OpResult)
-	sc.notifyChans = make(map[int]chan OpResult)
+	sc.notifyChans = make(map[opKey]chan OpResult)
 	sc.LastAppliedIndex = 0
 
 	go sc.applier()

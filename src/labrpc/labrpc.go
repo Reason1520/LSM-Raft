@@ -52,8 +52,10 @@ package labrpc
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -94,8 +96,30 @@ type ClientEnd struct {
 // the return value indicates success; false means that
 // no reply was received from the server.
 func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bool {
+	var doneLog chan struct{}
+	if os.Getenv("BENCH_DEBUG") == "1" {
+		doneLog = make(chan struct{})
+		start := time.Now()
+		go func() {
+			ticker := time.NewTicker(2 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					elapsed := time.Since(start).Seconds()
+					fmt.Fprintf(os.Stderr, "[labrpc] Call waiting svc=%s elapsed=%.1fs\n", svcMeth, elapsed)
+				case <-doneLog:
+					return
+				}
+			}
+		}()
+	}
 	if e.grpcClient != nil {
-		return e.grpcCall(svcMeth, args, reply)
+		ok := e.grpcCall(svcMeth, args, reply)
+		if doneLog != nil {
+			close(doneLog)
+		}
+		return ok
 	}
 	req := reqMsg{}
 	req.endname = e.endname
@@ -131,8 +155,14 @@ func (e *ClientEnd) Call(svcMeth string, args interface{}, reply interface{}) bo
 		if err := rd.Decode(reply); err != nil {
 			log.Fatalf("ClientEnd.Call(): decode reply: %v\n", err)
 		}
+		if doneLog != nil {
+			close(doneLog)
+		}
 		return true
 	} else {
+		if doneLog != nil {
+			close(doneLog)
+		}
 		return false
 	}
 }
