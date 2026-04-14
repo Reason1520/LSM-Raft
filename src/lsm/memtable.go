@@ -23,6 +23,7 @@ type KV struct {
 type Memtable struct {
 	currentTable     *SkipList
 	frozenTableQueue list.List
+	flushingTables   list.List
 	frozenBytes      int
 	maxTableSize     int
 	frozenMutex      sync.Mutex
@@ -33,6 +34,7 @@ func NewMemtable() *Memtable {
 	mt := new(Memtable)
 	mt.currentTable = NewSkipList(16)
 	mt.frozenTableQueue.Init()
+	mt.flushingTables.Init()
 	mt.frozenBytes = 0
 	mt.maxTableSize = 67108864 // Calculated from 64 * 1024 * 1024
 	return mt
@@ -55,6 +57,11 @@ func (mt *Memtable) NewMemtableIterator(skipDelete bool, trancID uint64) *HeapIt
 
 	mt.frozenMutex.Lock()
 	for e := mt.frozenTableQueue.Front(); e != nil; e = e.Next() {
+		it := e.Value.(*SkipList).NewIterator(nil, trancID)
+		it.Seek("")
+		iters = append(iters, it)
+	}
+	for e := mt.flushingTables.Front(); e != nil; e = e.Next() {
 		it := e.Value.(*SkipList).NewIterator(nil, trancID)
 		it.Seek("")
 		iters = append(iters, it)
@@ -115,7 +122,7 @@ func (mt *Memtable) CurGet(key string, trancID uint64) *SkipListIterator {
 
 // FrozenGet 获取冻结表中的键值对
 func (mt *Memtable) FrozenGet(key string, trancID uint64) *SkipListIterator {
-	if mt.frozenTableQueue.Len() == 0 {
+	if mt.frozenTableQueue.Len() == 0 && mt.flushingTables.Len() == 0 {
 		return mt.currentTable.NewIterator(nil, trancID)
 	}
 
@@ -124,6 +131,13 @@ func (mt *Memtable) FrozenGet(key string, trancID uint64) *SkipListIterator {
 		it := table.Get(key, trancID)
 		if it.Valid() && it.Key() == key {
 			// 找到即返回，因为这是当前能找到的最新的版本
+			return it
+		}
+	}
+	for e := mt.flushingTables.Front(); e != nil; e = e.Next() {
+		table := e.Value.(*SkipList)
+		it := table.Get(key, trancID)
+		if it.Valid() && it.Key() == key {
 			return it
 		}
 	}
@@ -224,6 +238,48 @@ func (mt *Memtable) PopOldFrozenTableLock() *SkipList {
 	mt.frozenTableQueue.Remove(element)
 
 	return skiplist
+}
+
+// PendingFrozenTables returns the number of frozen tables waiting to be flushed.
+func (mt *Memtable) PendingFrozenTables() int {
+	mt.frozenMutex.Lock()
+	defer mt.frozenMutex.Unlock()
+	return mt.frozenTableQueue.Len()
+}
+
+// ReserveOldestFrozenTable marks the oldest frozen table as in-flight for flushing.
+func (mt *Memtable) ReserveOldestFrozenTable() *SkipList {
+	mt.frozenMutex.Lock()
+	defer mt.frozenMutex.Unlock()
+
+	if mt.frozenTableQueue.Len() == 0 {
+		return nil
+	}
+	element := mt.frozenTableQueue.Back()
+	skiplist := element.Value.(*SkipList)
+	mt.frozenTableQueue.Remove(element)
+	mt.flushingTables.PushFront(skiplist)
+	return skiplist
+}
+
+// FinishFlushingTable removes a previously reserved frozen table from the flushing set.
+func (mt *Memtable) FinishFlushingTable(table *SkipList) {
+	if table == nil {
+		return
+	}
+	mt.frozenMutex.Lock()
+	defer mt.frozenMutex.Unlock()
+	for e := mt.flushingTables.Front(); e != nil; e = e.Next() {
+		if e.Value.(*SkipList) == table {
+			mt.flushingTables.Remove(e)
+			if mt.frozenBytes >= table.sizeByte {
+				mt.frozenBytes -= table.sizeByte
+			} else {
+				mt.frozenBytes = 0
+			}
+			return
+		}
+	}
 }
 
 // ItersPreffix 获取指定前缀的迭代器

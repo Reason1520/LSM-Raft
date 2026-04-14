@@ -49,14 +49,19 @@ type LSMEngine struct {
 	nextSSTID   uint16                // 每次分配sst_id时next_sst_id都会自增1
 	curMaxLevel uint16                // 当前SST的最大的level
 	idMu        sync.Mutex            // 分配sst_id的锁
-	compactMu   sync.Mutex            // 合并线程互斥
-	compactRun  bool                  // 是否已有合并线程在运行
-	compactWG   sync.WaitGroup        // 等待合并线程结束
-	closing     bool                  // 是否处于关闭流程中
-	compactCh   chan struct{}         // 合并触发通道（合并信号合并）
-	compactStop chan struct{}         // 合并线程退出信号
-	gcMu        sync.RWMutex          // 保护 gcWatermark
-	gcWatermark uint64                // MVCC GC 水位
+	flushMu     sync.Mutex
+	flushRun    bool
+	flushWG     sync.WaitGroup
+	compactMu   sync.Mutex     // 合并线程互斥
+	compactRun  bool           // 是否已有合并线程在运行
+	compactWG   sync.WaitGroup // 等待合并线程结束
+	closing     bool           // 是否处于关闭流程中
+	flushCh     chan struct{}
+	flushStop   chan struct{}
+	compactCh   chan struct{} // 合并触发通道（合并信号合并）
+	compactStop chan struct{} // 合并线程退出信号
+	gcMu        sync.RWMutex  // 保护 gcWatermark
+	gcWatermark uint64        // MVCC GC 水位
 }
 
 func NewLSMEngine(dataDir string) *LSMEngine {
@@ -68,6 +73,8 @@ func NewLSMEngine(dataDir string) *LSMEngine {
 		blockCache:  NewBlockCache(LSM_BLOCK_CACHE_CAPACITY, LSM_BLOCK_CACHE_K),
 		nextSSTID:   0,
 		curMaxLevel: 0,
+		flushCh:     make(chan struct{}, 1),
+		flushStop:   make(chan struct{}),
 		compactCh:   make(chan struct{}, 1),
 		compactStop: make(chan struct{}),
 	}
@@ -163,6 +170,7 @@ func NewLSMEngine(dataDir string) *LSMEngine {
 		}
 	}
 
+	engine.startFlushWorker()
 	engine.startCompactionWorker()
 	return engine
 }
@@ -187,12 +195,29 @@ func (lsme *LSMEngine) getGCWatermark() uint64 {
 	return w
 }
 
+func (lsme *LSMEngine) isClosing() bool {
+	lsme.compactMu.Lock()
+	closing := lsme.closing
+	lsme.compactMu.Unlock()
+	return closing
+}
+
+func (lsme *LSMEngine) signalFlush() {
+	if lsme.flushCh == nil {
+		return
+	}
+	select {
+	case lsme.flushCh <- struct{}{}:
+	default:
+	}
+}
+
 // Put: 插入数据
 func (lsme *LSMEngine) Put(key string, value string, trancID uint64) uint64 {
 	lsme.memtable.PutLock(key, value, trancID)
 
-	if lsme.memtable.frozenTableQueue.Len() > 0 {
-		return lsme.Flush(false)
+	if lsme.memtable.PendingFrozenTables() > 0 {
+		lsme.signalFlush()
 	}
 
 	return 0
@@ -209,8 +234,8 @@ func (lsme *LSMEngine) Remove(key string, trancID uint64) uint64 {
 func (lsme *LSMEngine) PutBatch(KVs []KV, trancID uint64) uint64 {
 	lsme.memtable.PutBatch(KVs, trancID)
 
-	if lsme.memtable.frozenTableQueue.Len() > 0 {
-		return lsme.Flush(false)
+	if lsme.memtable.PendingFrozenTables() > 0 {
+		lsme.signalFlush()
 	}
 
 	return 0
@@ -280,15 +305,7 @@ func (lsme *LSMEngine) GetBatch(keys []string, trancID uint64) map[string]VwithI
 	return res
 }
 
-// Flush: 刷盘
-func (lsme *LSMEngine) Flush(flushcur bool) uint64 {
-	// 获取一个table
-	var table *SkipList
-	if flushcur {
-		table = lsme.memtable.currentTable
-	} else {
-		table = lsme.memtable.PopOldFrozenTableLock()
-	}
+func (lsme *LSMEngine) flushTable(table *SkipList) uint64 {
 	if table == nil {
 		return 0
 	}
@@ -331,11 +348,29 @@ func (lsme *LSMEngine) Flush(flushcur bool) uint64 {
 	return 0
 }
 
+// Flush: 刷盘
+func (lsme *LSMEngine) Flush(flushcur bool) uint64 {
+	if flushcur {
+		return lsme.flushTable(lsme.memtable.currentTable)
+	}
+
+	table := lsme.memtable.ReserveOldestFrozenTable()
+	if table == nil {
+		return 0
+	}
+	defer lsme.memtable.FinishFlushingTable(table)
+	return lsme.flushTable(table)
+}
+
 // Close: 关闭lsme
 func (lsme *LSMEngine) Close() {
 	lsme.compactMu.Lock()
 	lsme.closing = true
 	lsme.compactMu.Unlock()
+	if lsme.flushStop != nil {
+		close(lsme.flushStop)
+	}
+	lsme.flushWG.Wait()
 	if lsme.compactStop != nil {
 		close(lsme.compactStop)
 	}
@@ -344,7 +379,7 @@ func (lsme *LSMEngine) Close() {
 	// 将memtable中的数据刷盘
 	for {
 		// 刷frozen table
-		if lsme.memtable.frozenTableQueue.Len() == 0 {
+		if lsme.memtable.PendingFrozenTables() == 0 {
 			break
 		}
 		lsme.Flush(false)
@@ -670,6 +705,55 @@ func (lsme *LSMEngine) allocSSTID() uint16 {
 	lsme.nextSSTID++
 	lsme.idMu.Unlock()
 	return id
+}
+
+func (lsme *LSMEngine) runFlushAll() {
+	for {
+		if lsme.memtable.PendingFrozenTables() == 0 {
+			return
+		}
+		if lsme.Flush(false) == 0 {
+			return
+		}
+	}
+}
+
+func (lsme *LSMEngine) startFlushWorker() {
+	if lsme.flushCh == nil || lsme.flushStop == nil {
+		return
+	}
+	lsme.flushWG.Add(1)
+	go func() {
+		defer lsme.flushWG.Done()
+		for {
+			select {
+			case <-lsme.flushStop:
+				return
+			case <-lsme.flushCh:
+				lsme.runFlushOnce()
+			}
+		}
+	}()
+}
+
+func (lsme *LSMEngine) runFlushOnce() {
+	if lsme.isClosing() {
+		return
+	}
+
+	lsme.flushMu.Lock()
+	if lsme.flushRun {
+		lsme.flushMu.Unlock()
+		return
+	}
+	lsme.flushRun = true
+	lsme.flushMu.Unlock()
+
+	lsme.runFlushAll()
+
+	lsme.flushMu.Lock()
+	lsme.flushRun = false
+	lsme.flushMu.Unlock()
 }
 
 // startCompactionWorker starts a single background worker for compaction triggers.
