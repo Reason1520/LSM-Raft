@@ -34,11 +34,11 @@ func benchLogf(format string, args ...interface{}) {
 }
 
 func startProgress(label string) (func(), *uint64, time.Time) {
+	start := time.Now()
 	if os.Getenv("BENCH_PROGRESS") != "1" {
-		return func() {}, nil, time.Time{}
+		return func() {}, nil, start
 	}
 	var count uint64
-	start := time.Now()
 	stopCh := make(chan struct{})
 	go func() {
 		ticker := time.NewTicker(5 * time.Second)

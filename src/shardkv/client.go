@@ -46,8 +46,9 @@ type Clerk struct {
 	config  shardctrler.Config
 	makeEnd func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
-	ClientID  int64
-	nextRPCID int64
+	ClientID   int64
+	nextRPCID  int64
+	leaderHint map[int]int
 }
 
 // the tester calls MakeClerk.
@@ -65,11 +66,49 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, makeEnd func(string) *labrpc.ClientE
 	// You'll have to add code here.
 	ck.ClientID = nrand()
 	ck.nextRPCID = 1
+	ck.leaderHint = make(map[int]int)
+	ck.refreshConfig()
 	return ck
 }
 
 func (ck *Clerk) allocRPCID() int64 {
 	return atomic.AddInt64(&ck.nextRPCID, 1)
+}
+
+func (ck *Clerk) refreshConfig() {
+	ck.config = ck.sm.Query(-1)
+}
+
+func (ck *Clerk) serverOrder(gid int, n int) []int {
+	order := make([]int, 0, n)
+	if n <= 0 {
+		return order
+	}
+	if hint, ok := ck.leaderHint[gid]; ok && hint >= 0 && hint < n {
+		order = append(order, hint)
+		for i := 0; i < n; i++ {
+			if i != hint {
+				order = append(order, i)
+			}
+		}
+		return order
+	}
+	for i := 0; i < n; i++ {
+		order = append(order, i)
+	}
+	return order
+}
+
+func (ck *Clerk) rememberLeader(gid, serverIdx int) {
+	if serverIdx >= 0 {
+		ck.leaderHint[gid] = serverIdx
+	}
+}
+
+func (ck *Clerk) forgetLeader(gid, serverIdx int) {
+	if hint, ok := ck.leaderHint[gid]; ok && hint == serverIdx {
+		delete(ck.leaderHint, gid)
+	}
 }
 
 // fetch the current value for a key.
@@ -94,22 +133,25 @@ func (ck *Clerk) GetWithErr(key string) (string, Err) {
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
-			for si := 0; si < len(servers); si++ {
+			for _, si := range ck.serverOrder(gid, len(servers)) {
 				srv := ck.makeEnd(servers[si])
 				var reply GetReply
 				ok := srv.Call("ShardKV.Get", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey || reply.Err == ErrRepeated) {
+					ck.rememberLeader(gid, si)
 					return reply.Value, reply.Err
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					ck.forgetLeader(gid, si)
 					break
 				}
+				ck.forgetLeader(gid, si)
 				// ... not ok, or ErrWrongLeader ErrTimeout
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask controller for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.refreshConfig()
 	}
 
 	return "", ErrTimeout
@@ -130,22 +172,25 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		shard := key2shard(key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
-			for si := 0; si < len(servers); si++ {
+			for _, si := range ck.serverOrder(gid, len(servers)) {
 				srv := ck.makeEnd(servers[si])
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey || reply.Err == ErrRepeated) {
+					ck.rememberLeader(gid, si)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					ck.forgetLeader(gid, si)
 					break
 				}
+				ck.forgetLeader(gid, si)
 				// ... not ok, or ErrWrongLeader ErrTimeout
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
 		// ask controller for the latest configuration.
-		ck.config = ck.sm.Query(-1)
+		ck.refreshConfig()
 	}
 }
 
@@ -187,19 +232,22 @@ func (ck *Clerk) Range(start, end string, limit int) []KeyValue {
 			}
 
 			got := false
-			for si := 0; si < len(servers); si++ {
+			for _, si := range ck.serverOrder(gid, len(servers)) {
 				srv := ck.makeEnd(servers[si])
 				var reply RangeReply
 				ok := srv.Call("ShardKV.Range", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey || reply.Err == ErrRepeated) {
+					ck.rememberLeader(gid, si)
 					all = append(all, reply.KVs...)
 					got = true
 					break
 				}
 				if ok && reply.Err == ErrWrongGroup {
+					ck.forgetLeader(gid, si)
 					needRefresh = true
 					break
 				}
+				ck.forgetLeader(gid, si)
 			}
 
 			if needRefresh {
@@ -222,6 +270,6 @@ func (ck *Clerk) Range(start, end string, limit int) []KeyValue {
 		}
 
 		time.Sleep(100 * time.Millisecond)
-		ck.config = ck.sm.Query(-1)
+		ck.refreshConfig()
 	}
 }
