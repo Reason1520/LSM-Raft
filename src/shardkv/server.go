@@ -98,6 +98,117 @@ func (kv *ShardKV) canServe(shard int) bool {
 	return kv.config.Shards[shard] == kv.gid && (kv.shardStatus[shard] == Serving || kv.shardStatus[shard] == GCing)
 }
 
+func (kv *ShardKV) waitAppliedLocked(index int, deadline time.Time) bool {
+	for kv.lastApplied < index {
+		kv.mu.Unlock()
+		if time.Now().After(deadline) {
+			kv.mu.Lock()
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+		kv.mu.Lock()
+	}
+	return true
+}
+
+func (kv *ShardKV) getSafeReadIndex() (int, bool) {
+	return kv.rf.LeaseReadIndex()
+}
+
+func (kv *ShardKV) fastGet(key string, rpcID int64) (OpResult, bool) {
+	readIndex, ok := kv.getSafeReadIndex()
+	if !ok {
+		return OpResult{}, false
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	shard := key2shard(key)
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if !kv.waitAppliedLocked(readIndex, deadline) {
+		return OpResult{Err: ErrTimeout, RPCID: rpcID}, true
+	}
+	if !kv.canServe(shard) {
+		return OpResult{Err: ErrWrongGroup, RPCID: rpcID}, true
+	}
+
+	engine := kv.kvDB[shard]
+	if engine == nil {
+		return OpResult{Err: ErrNoKey, RPCID: rpcID}, true
+	}
+	enc, _ := engine.Get(key, uint64(readIndex))
+	val, ok := decodeValue(enc)
+	if !ok {
+		return OpResult{Err: ErrNoKey, RPCID: rpcID}, true
+	}
+	return OpResult{Err: OK, Value: val, RPCID: rpcID}, true
+}
+
+func (kv *ShardKV) fastRange(start, end string, limit, shard int, rpcID int64) (OpResult, bool) {
+	readIndex, ok := kv.getSafeReadIndex()
+	if !ok {
+		return OpResult{}, false
+	}
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	if limit < 0 {
+		limit = 0
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if !kv.waitAppliedLocked(readIndex, deadline) {
+		return OpResult{Err: ErrTimeout, RPCID: rpcID}, true
+	}
+	if !kv.canServe(shard) {
+		return OpResult{Err: ErrWrongGroup, RPCID: rpcID}, true
+	}
+
+	engine := kv.kvDB[shard]
+	if engine == nil {
+		return OpResult{Err: OK, RPCID: rpcID, KVs: nil}, true
+	}
+
+	pred := func(k string) int {
+		if k < start {
+			return 1
+		}
+		if end != "" && k >= end {
+			return -1
+		}
+		return 0
+	}
+
+	startIt, endIt, ok := engine.LsmItersMonotonyPredicate(uint64(readIndex), pred)
+	if !ok || startIt == nil {
+		return OpResult{Err: OK, RPCID: rpcID, KVs: nil}, true
+	}
+	defer startIt.Close()
+	if endIt != nil {
+		defer endIt.Close()
+	}
+
+	out := make([]KeyValue, 0)
+	for startIt.Valid() {
+		k := startIt.Key()
+		if pred(k) != 0 {
+			break
+		}
+		if v, ok := decodeValue(startIt.Value()); ok {
+			out = append(out, KeyValue{Key: k, Value: v})
+			if limit > 0 && len(out) >= limit {
+				break
+			}
+		}
+		startIt.Next()
+	}
+
+	return OpResult{Err: OK, RPCID: rpcID, KVs: out}, true
+}
+
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 	shard := key2shard(args.Key)
 	kv.mu.Lock()
@@ -107,6 +218,12 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 		return
 	}
 	kv.mu.Unlock()
+
+	if res, ok := kv.fastGet(args.Key, args.RPCID); ok {
+		reply.Err = res.Err
+		reply.Value = res.Value
+		return
+	}
 
 	op := Op{
 		Type:     GET,
@@ -129,6 +246,12 @@ func (kv *ShardKV) Range(args *RangeArgs, reply *RangeReply) {
 		return
 	}
 	kv.mu.Unlock()
+
+	if res, ok := kv.fastRange(args.Start, args.End, args.Limit, args.ShardID, args.RPCID); ok {
+		reply.Err = res.Err
+		reply.KVs = res.KVs
+		return
+	}
 
 	op := Op{
 		Type:       RANGE,

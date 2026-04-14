@@ -68,6 +68,8 @@ const (
 
 var PRINTINF = false // 打印信息
 
+const leaderLeaseTimeout = 150 * time.Millisecond
+
 // ApplyMsg : 当日志条目被commit，该服务器会向m.applyCh发送一个ApplyMsg
 type ApplyMsg struct {
 	CommandValid bool
@@ -97,8 +99,9 @@ type Snapshot struct {
 
 // Raft : A Go object implementing a single Raft peer.
 type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	applyCond *sync.Cond          // applychannel的条件变量,表示当前有已经commmit的log可以apply
+	mu        sync.Mutex // Lock to protect shared access to this peer's state
+	applyCond *sync.Cond // applychannel的条件变量,表示当前有已经commmit的log可以apply
+	readCond  *sync.Cond
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
@@ -126,6 +129,8 @@ type Raft struct {
 	nextIndex   []int           // 对于每个服务器,要发送给该服务器的下一个日志条目的索引下一个要发送的索引(初始化为Leader的最后一个日志索引+1)
 	matchIndex  []int           // 对于每个服务器,该服务器已经知道的复制该日志的最高索引值(初始化为0,单增)
 	replicateCh []chan struct{} // per-follower replication triggers
+	peerAckTerm []int
+	peerAckTime []time.Time
 }
 
 // return currentTerm and whether this server
@@ -600,6 +605,8 @@ func (rf *Raft) initLeaderStateLocked(lastLogIndex int) {
 	for i := range rf.peers {
 		rf.nextIndex[i] = lastLogIndex + 1
 		rf.matchIndex[i] = 0
+		rf.peerAckTerm[i] = 0
+		rf.peerAckTime[i] = time.Time{}
 	}
 	rf.matchIndex[rf.me] = lastLogIndex
 }
@@ -610,6 +617,81 @@ func (rf *Raft) hasPendingReplicationLocked(server int) bool {
 		return true
 	}
 	return rf.nextIndex[server] <= lastLogIndex
+}
+
+func (rf *Raft) markPeerAckLocked(server int) {
+	rf.peerAckTerm[server] = rf.currentTerm
+	rf.peerAckTime[server] = time.Now()
+}
+
+func (rf *Raft) HasCommittedCurrentTerm() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.role != LEADER {
+		return false
+	}
+	return rf.commitIndex > 0 && rf.getLogTerm(rf.commitIndex) == rf.currentTerm
+}
+
+func (rf *Raft) LeaseReadIndex() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.role != LEADER {
+		return -1, false
+	}
+	if rf.commitIndex <= 0 || rf.getLogTerm(rf.commitIndex) != rf.currentTerm {
+		return -1, false
+	}
+
+	now := time.Now()
+	quorum := 1
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		if rf.peerAckTerm[i] != rf.currentTerm {
+			continue
+		}
+		if now.Sub(rf.peerAckTime[i]) <= leaderLeaseTimeout {
+			quorum++
+		}
+	}
+	if quorum > len(rf.peers)/2 {
+		return rf.commitIndex, true
+	}
+	return -1, false
+}
+
+func (rf *Raft) ReadIndex(timeout time.Duration) (int, bool) {
+	start := time.Now()
+	rf.signalAllReplicators()
+
+	for time.Since(start) < timeout {
+		rf.mu.Lock()
+		if rf.role != LEADER {
+			rf.mu.Unlock()
+			return -1, false
+		}
+		term := rf.currentTerm
+		readIndex := rf.commitIndex
+		quorum := 1
+		for i := range rf.peers {
+			if i == rf.me {
+				continue
+			}
+			if rf.peerAckTerm[i] == term && !rf.peerAckTime[i].Before(start) {
+				quorum++
+			}
+		}
+		rf.mu.Unlock()
+		if quorum > len(rf.peers)/2 {
+			return readIndex, true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return -1, false
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -699,6 +781,7 @@ func (rf *Raft) replicateOneRound(server int) bool {
 			rf.matchIndex[server] = args.LastIncludedIndex
 			rf.nextIndex[server] = args.LastIncludedIndex + 1
 		}
+		rf.markPeerAckLocked(server)
 		return rf.hasPendingReplicationLocked(server)
 	}
 
@@ -746,6 +829,7 @@ func (rf *Raft) replicateOneRound(server int) bool {
 			rf.nextIndex[server] = rf.matchIndex[server] + 1
 			rf.updateCommitIndex()
 		}
+		rf.markPeerAckLocked(server)
 		return rf.hasPendingReplicationLocked(server) && rf.nextIndex[server] <= lastLogIndex
 	}
 
@@ -1062,6 +1146,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.persister = persister
 	rf.me = me
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.readCond = sync.NewCond(&rf.mu)
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.currentTerm = 0
@@ -1083,6 +1168,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
 	rf.replicateCh = make([]chan struct{}, len(peers))
+	rf.peerAckTerm = make([]int, len(peers))
+	rf.peerAckTime = make([]time.Time, len(peers))
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
