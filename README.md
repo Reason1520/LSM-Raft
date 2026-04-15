@@ -38,11 +38,13 @@ LSM-Tree (存储层)
 - LSM-Tree 存储（多层 SST + Compaction）
 - MVCC（版本号为 Raft 日志 index）
 - 单 shard 事务（ReadCommitted / RepeatableRead / Serializable）
+- leader lease 普通只读快路径（Get/Range）
 - 范围查询（单 shard 线性一致，跨 shard 聚合）
 - gRPC 对外访问层（内部 RPC 可选 labrpc / gRPC 传输）
 
 ## 一致性与语义
-- **单 shard Get/Put/Append/Range**：线性一致（通过 Raft log index 快照读）
+- **单 shard Get/Range**：线性一致；leader 优先走基于最近多数派确认的 lease read，本地按 `commitIndex` 快照读取，lease 不可用时回退到原 Raft 日志路径
+- **单 shard Put/Append**：线性一致（经 Raft 提交后写入状态机）
 - **跨 shard Range**：客户端逐 shard 查询并合并，不保证全局原子快照
 - **事务**：单 shard 内提交原子性；跨 shard 事务不支持
 
@@ -52,6 +54,15 @@ LSM-Tree (存储层)
   Windows: `%TEMP%\shardkv-<gid>-<me>\shard-<id>`
 - Compaction 由后台队列驱动（通道触发 + 定时兜底）
 - MVCC GC：Compaction 时根据 watermark 清理旧版本，每个 key 保留一个兜底旧版本
+
+## 近期优化
+- 普通 `Get/Range`：增加 leader lease 只读快路径，把大量只读请求从 Raft 主路径摘出
+- Raft 复制：使用 per-follower replicator，并支持 batching / pipelining
+- 客户端路由：按 `gid` 缓存最近 leader，减少无效探测
+- 存储写路径：memtable 冻结后后台 flush，compaction 异步执行
+- `ShardKV applier`：事务提交和 shard 导入改成批量写 LSM，减少逐条写入开销
+- Snapshot：构建和编码下沉到后台 worker，前台只排队最新快照任务
+- Benchmark：修正吞吐统计口径，并补充本地只读延迟测试
 
 ## 运行方式
 ### 1. 启动 in-process Demo（内部 labrpc）
@@ -100,6 +111,18 @@ go test ./lsm/tests -v
 go test ./lsm -v
 ```
 
+常用回归：
+```bash
+go test ./shardkv -run "TestSnapshot5B|TestTxn|TestRange" -count=1
+go test ./raft -run "TestBasicAgree3B|TestRejoin3B" -count=1
+```
+
+本地性能回归：
+```bash
+go test ./shardkv -run TestResumeWriteThroughputLocal -count=1 -v
+go test ./shardkv -run TestResumePointReadLatencyLocal -count=1 -v
+```
+
 ## 基准测试与日志控制
 基准测试示例（仅跑 Benchmark，不跑单元测试）：
 ```bash
@@ -120,12 +143,35 @@ BENCH_DEBUG=1 go test ./shardkv -run ^$ -bench BenchmarkShardKVPut -benchtime=15
 ```bash
 # ShardKV（内部 labrpc）
 go test ./shardkv -run ^$ -bench BenchmarkShardKVPut -benchtime=15s -v -count=1
+go test ./shardkv -run ^$ -bench BenchmarkShardKVPutParallel -benchtime=15s -v -count=1
 go test ./shardkv -run ^$ -bench BenchmarkShardKVGet -benchtime=15s -v -count=1
 go test ./shardkv -run ^$ -bench BenchmarkShardKVRange -benchtime=15s -v -count=1
 
 # gRPC 对外客户端（Put+Get 混合）
 go test ./shardkv -run ^$ -bench BenchmarkGRPCPutGet -benchtime=15s -v -count=1
 ```
+
+Benchmark 方法说明：
+- `BenchmarkShardKVPut`：3 节点 demo cluster，1024 个固定 key，计时后循环单次 `Put` 覆盖写
+- `BenchmarkShardKVPutParallel`：3 节点 demo cluster，`b.RunParallel` 为每个 worker 创建独立 Clerk，并发执行 `Put`
+- `BenchmarkShardKVGet`：先预热写入 1024 个 key，计时后循环单次 `Get`
+- `BenchmarkShardKVRange`：先预热 5000 个连续 `a` 前缀 key，计时后循环做完整前缀 `Range("a", "a~", 0)`
+- `BenchmarkGRPCPutGet`：3 节点 gRPC cluster + 对外 gRPC server，计时后每轮做一次 `Put` 和一次 `Get`
+
+说明：
+- `BenchmarkShardKVPut/Get/Range` 主要反映单请求平均成本和改动前后对比
+- `BenchmarkShardKVPutParallel` 是并发 benchmark，反映多 worker 同时打 3 节点集群时的顺序 `Put` 吞吐
+- 真正回答“并发写吞吐”时，仍建议同时引用 `TestResumeWriteThroughputLocal` 这类可控多 worker 压测
+
+本机参考结果：
+`2026-04-15`，`Windows / Ryzen 7 5800H`，仅供本地对比，不代表跨机器绝对指标。
+
+- 三节点写吞吐：`567 ops/s`
+- 点读延迟：`mean 83us / p95 534us / p99 1.011ms`
+- `BenchmarkShardKVPut`：`144.1 ops/s`
+- `BenchmarkShardKVPutParallel`：`451.5 ops/s`
+- `BenchmarkShardKVGet`：`14637 ops/s`
+- `BenchmarkShardKVRange`：`165.3 ops/s`
 
 ## 备注
 - 测试仍基于 `labrpc`（网络可控），但已支持 gRPC 传输作为内部 RPC

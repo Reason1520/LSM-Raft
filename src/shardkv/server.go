@@ -91,6 +91,23 @@ type ShardKV struct {
 	activeTxn     map[uint64]uint64
 	activeTxnLast map[uint64]time.Time
 	gcWatermark   uint64
+
+	snapshotMu     sync.Mutex
+	pendingSnap    *snapshotTask
+	snapshotNotify chan struct{}
+	snapshotStop   chan struct{}
+	snapshotWG     sync.WaitGroup
+	snapshotRefsWG sync.WaitGroup
+}
+
+type snapshotTask struct {
+	index      int
+	engines    map[int]*lsm.LSMEngine
+	shadowDB   map[int]map[int]map[string]string
+	shardState map[int]int
+	lastOps    map[int64]OpResult
+	config     shardctrler.Config
+	lastConfig shardctrler.Config
 }
 
 // Check strictly if I can serve this key
@@ -616,7 +633,7 @@ func (kv *ShardKV) applier() {
 			}
 
 			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
-				kv.snapshot(index)
+				kv.enqueueSnapshotLocked(index)
 			}
 
 			kv.lastApplied = index
@@ -767,7 +784,8 @@ func (kv *ShardKV) applyReconfig(op Op) OpResult {
 						kv.shadowDB[kv.lastConfig.Num] = make(map[int]map[string]string)
 					}
 					if engine := kv.kvDB[i]; engine != nil {
-						kv.shadowDB[kv.lastConfig.Num][i] = kv.exportShardData(engine)
+						kv.snapshotRefsWG.Wait()
+						kv.shadowDB[kv.lastConfig.Num][i] = kv.exportShardDataAt(engine, 0)
 						engine.Close()
 					} else {
 						kv.shadowDB[kv.lastConfig.Num][i] = make(map[string]string)
@@ -784,8 +802,12 @@ func (kv *ShardKV) applyReconfig(op Op) OpResult {
 func (kv *ShardKV) applyInsertShard(op Op) OpResult {
 	if op.ConfigNum == kv.config.Num && kv.shardStatus[op.ShardID] == Pulling {
 		engine := kv.ensureShardEngine(op.ShardID)
-		for k, v := range op.ShardData {
-			engine.Put(k, encodeValue(v), 0)
+		if len(op.ShardData) > 0 {
+			batch := make([]lsm.KV, 0, len(op.ShardData))
+			for k, v := range op.ShardData {
+				batch = append(batch, lsm.KV{Key: k, Value: encodeValue(v)})
+			}
+			engine.PutBatch(batch, 0)
 		}
 
 		for clientId, otherRes := range op.LastOpMap {
@@ -862,11 +884,21 @@ func (kv *ShardKV) applyTxnCommit(op Op, index int) OpResult {
 	}
 
 	trancID := uint64(index)
-	for _, w := range op.Writes {
-		if w.Delete {
-			engine.Remove(w.Key, trancID)
-		} else {
-			engine.Put(w.Key, encodeValue(w.Value), trancID)
+	if len(op.Writes) > 0 {
+		putBatch := make([]lsm.KV, 0, len(op.Writes))
+		deleteBatch := make([]string, 0, len(op.Writes))
+		for _, w := range op.Writes {
+			if w.Delete {
+				deleteBatch = append(deleteBatch, w.Key)
+			} else {
+				putBatch = append(putBatch, lsm.KV{Key: w.Key, Value: encodeValue(w.Value)})
+			}
+		}
+		if len(putBatch) > 0 {
+			engine.PutBatch(putBatch, trancID)
+		}
+		if len(deleteBatch) > 0 {
+			engine.RemoveBatch(deleteBatch, trancID)
 		}
 	}
 
@@ -995,12 +1027,12 @@ func (kv *ShardKV) ensureShardEngine(shard int) *lsm.LSMEngine {
 	return kv.kvDB[shard]
 }
 
-func (kv *ShardKV) exportShardData(engine *lsm.LSMEngine) map[string]string {
+func (kv *ShardKV) exportShardDataAt(engine *lsm.LSMEngine, snapshot uint64) map[string]string {
 	out := make(map[string]string)
 	if engine == nil {
 		return out
 	}
-	start, end, ok := engine.LsmItersMonotonyPredicate(0, func(string) int { return 0 })
+	start, end, ok := engine.LsmItersMonotonyPredicate(snapshot, func(string) int { return 0 })
 	if !ok || start == nil {
 		return out
 	}
@@ -1019,17 +1051,102 @@ func (kv *ShardKV) exportShardData(engine *lsm.LSMEngine) map[string]string {
 	return out
 }
 
-func (kv *ShardKV) exportAllShards() map[int]map[string]string {
+func (kv *ShardKV) exportAllShardsAt(snapshot uint64, engines map[int]*lsm.LSMEngine) map[int]map[string]string {
 	out := make(map[int]map[string]string)
-	for shard, engine := range kv.kvDB {
+	for shard, engine := range engines {
 		if engine != nil {
-			out[shard] = kv.exportShardData(engine)
+			out[shard] = kv.exportShardDataAt(engine, snapshot)
 		}
 	}
 	return out
 }
 
+func cloneIntStringMap(src map[string]string) map[string]string {
+	dst := make(map[string]string, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
+func cloneShadowDB(src map[int]map[int]map[string]string) map[int]map[int]map[string]string {
+	dst := make(map[int]map[int]map[string]string, len(src))
+	for cfgNum, shards := range src {
+		shardCopy := make(map[int]map[string]string, len(shards))
+		for shardID, data := range shards {
+			shardCopy[shardID] = cloneIntStringMap(data)
+		}
+		dst[cfgNum] = shardCopy
+	}
+	return dst
+}
+
+func cloneShardStatus(src map[int]int) map[int]int {
+	dst := make(map[int]int, len(src))
+	for shard, status := range src {
+		dst[shard] = status
+	}
+	return dst
+}
+
+func cloneLastOps(src map[int64]OpResult) map[int64]OpResult {
+	dst := make(map[int64]OpResult, len(src))
+	for clientID, res := range src {
+		dst[clientID] = res
+	}
+	return dst
+}
+
+func (kv *ShardKV) captureSnapshotTaskLocked(index int) *snapshotTask {
+	engines := make(map[int]*lsm.LSMEngine, len(kv.kvDB))
+	for shard, engine := range kv.kvDB {
+		if engine != nil {
+			engines[shard] = engine
+		}
+	}
+	kv.snapshotRefsWG.Add(1)
+	return &snapshotTask{
+		index:      index,
+		engines:    engines,
+		shadowDB:   cloneShadowDB(kv.shadowDB),
+		shardState: cloneShardStatus(kv.shardStatus),
+		lastOps:    cloneLastOps(kv.lastOps),
+		config:     kv.config,
+		lastConfig: kv.lastConfig,
+	}
+}
+
+func (kv *ShardKV) releaseSnapshotTask(task *snapshotTask) {
+	if task != nil {
+		kv.snapshotRefsWG.Done()
+	}
+}
+
+func (kv *ShardKV) enqueueSnapshotLocked(index int) {
+	task := kv.captureSnapshotTaskLocked(index)
+
+	var dropped *snapshotTask
+	kv.snapshotMu.Lock()
+	if kv.pendingSnap != nil && kv.pendingSnap.index >= task.index {
+		dropped = task
+	} else {
+		dropped = kv.pendingSnap
+		kv.pendingSnap = task
+	}
+	kv.snapshotMu.Unlock()
+
+	if dropped != nil {
+		kv.releaseSnapshotTask(dropped)
+	}
+
+	select {
+	case kv.snapshotNotify <- struct{}{}:
+	default:
+	}
+}
+
 func (kv *ShardKV) restoreAllShards(snapshot map[int]map[string]string) {
+	kv.snapshotRefsWG.Wait()
 	for _, engine := range kv.kvDB {
 		if engine != nil {
 			engine.Close()
@@ -1157,19 +1274,46 @@ func (kv *ShardKV) monitorGC() {
 
 // --- Snapshot ---
 
-func (kv *ShardKV) snapshot(index int) {
+func (kv *ShardKV) runSnapshotTask(task *snapshotTask) {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-
-	kvdbSnapshot := kv.exportAllShards()
+	kvdbSnapshot := kv.exportAllShardsAt(uint64(task.index), task.engines)
 	e.Encode(kvdbSnapshot)
-	e.Encode(kv.shadowDB)
-	e.Encode(kv.shardStatus)
-	e.Encode(kv.lastOps)
-	e.Encode(kv.config)
-	e.Encode(kv.lastConfig)
+	e.Encode(task.shadowDB)
+	e.Encode(task.shardState)
+	e.Encode(task.lastOps)
+	e.Encode(task.config)
+	e.Encode(task.lastConfig)
 
-	kv.rf.Snapshot(index, w.Bytes())
+	kv.rf.Snapshot(task.index, w.Bytes())
+}
+
+func (kv *ShardKV) snapshotWorker() {
+	defer kv.snapshotWG.Done()
+	for {
+		select {
+		case <-kv.snapshotNotify:
+		case <-kv.snapshotStop:
+			kv.snapshotMu.Lock()
+			pending := kv.pendingSnap
+			kv.pendingSnap = nil
+			kv.snapshotMu.Unlock()
+			kv.releaseSnapshotTask(pending)
+			return
+		}
+
+		for {
+			kv.snapshotMu.Lock()
+			task := kv.pendingSnap
+			kv.pendingSnap = nil
+			kv.snapshotMu.Unlock()
+			if task == nil {
+				break
+			}
+			kv.runSnapshotTask(task)
+			kv.releaseSnapshotTask(task)
+		}
+	}
 }
 
 func (kv *ShardKV) readSnapshot(data []byte) {
@@ -1194,6 +1338,7 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 		d.Decode(&lastConfig) != nil {
 		log.Fatal("ReadSnapshot decode error")
 	} else {
+		kv.snapshotRefsWG.Wait()
 		kv.restoreAllShards(kvDB)
 		kv.shadowDB = shadowDB
 		kv.shardStatus = shardStatus
@@ -1205,6 +1350,10 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 
 func (kv *ShardKV) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
+	if kv.snapshotStop != nil {
+		close(kv.snapshotStop)
+		kv.snapshotWG.Wait()
+	}
 	kv.rf.Kill()
 }
 
@@ -1248,9 +1397,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.waitCh = make(map[int]chan OpResult)
 	kv.activeTxn = make(map[uint64]uint64)
 	kv.activeTxnLast = make(map[uint64]time.Time)
+	kv.snapshotNotify = make(chan struct{}, 1)
+	kv.snapshotStop = make(chan struct{})
 
 	kv.readSnapshot(persister.ReadSnapshot())
 
+	kv.snapshotWG.Add(1)
+	go kv.snapshotWorker()
 	go kv.applier()
 	go kv.monitorConfig()
 	go kv.monitorMigration()

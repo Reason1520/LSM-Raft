@@ -182,6 +182,25 @@ func StartDemoCluster(groupN int) (*DemoCluster, *Clerk) {
 	return dc, ck
 }
 
+// NewClerk creates another shardkv client attached to this demo cluster.
+func (dc *DemoCluster) NewClerk() *Clerk {
+	ctrlEnds := make([]*labrpc.ClientEnd, 1)
+	endname := demoRandString(20)
+	ctrlEnds[0] = dc.net.MakeEnd(endname)
+	dc.net.Connect(endname, dc.ctrlerNames[0])
+	dc.net.Enable(endname, true)
+
+	ck := MakeClerk(ctrlEnds, func(servername string) *labrpc.ClientEnd {
+		name := demoRandString(20)
+		end := dc.net.MakeEnd(name)
+		dc.net.Connect(name, servername)
+		dc.net.Enable(name, true)
+		return end
+	})
+	time.Sleep(50 * time.Millisecond)
+	return ck
+}
+
 // Close stops all servers and cleans up the network.
 func (dc *DemoCluster) Close() {
 	for i := 0; i < len(dc.groupServers); i++ {

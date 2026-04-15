@@ -88,6 +88,33 @@ func BenchmarkShardKVPut(b *testing.B) {
 	reportQPS(b, b.N, start)
 }
 
+func BenchmarkShardKVPutParallel(b *testing.B) {
+	benchLogf("[bench labrpc-put-par] init: start demo cluster")
+	dc, _ := shardkv.StartDemoCluster(3)
+	defer dc.Close()
+	benchLogf("[bench labrpc-put-par] init: cluster ready")
+
+	var workerID uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	stop, counter, start := startProgress("labrpc-put-par")
+	b.RunParallel(func(pb *testing.PB) {
+		id := int(atomic.AddUint64(&workerID, 1) - 1)
+		ck := dc.NewClerk()
+		seq := 0
+		for pb.Next() {
+			key := fmt.Sprintf("%c-put-par-w%02d-%08d", byte('0'+((id+seq)%10)), id, seq)
+			ck.Put(key, "v")
+			seq++
+			if counter != nil {
+				atomic.AddUint64(counter, 1)
+			}
+		}
+	})
+	stop()
+	reportQPS(b, b.N, start)
+}
+
 func BenchmarkShardKVGet(b *testing.B) {
 	benchLogf("[bench labrpc-get] init: start demo cluster")
 	dc, ck := shardkv.StartDemoCluster(3)
