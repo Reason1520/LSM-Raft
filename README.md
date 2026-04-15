@@ -57,6 +57,7 @@ LSM-Tree (存储层)
 
 ## 近期优化
 - 普通 `Get/Range`：增加 leader lease 只读快路径，把大量只读请求从 Raft 主路径摘出
+- `Range` 路径：客户端按 `[start, end)` 裁剪目标 shard，单 shard 范围不再盲扫全部 shard；服务端直接 `Seek(start)` 扫描，去掉多余 iterator 构建
 - Raft 复制：使用 per-follower replicator，并支持 batching / pipelining
 - 客户端路由：按 `gid` 缓存最近 leader，减少无效探测
 - 存储写路径：memtable 冻结后后台 flush，compaction 异步执行
@@ -160,6 +161,7 @@ Benchmark 方法说明：
 
 说明：
 - `BenchmarkShardKVPut/Get/Range` 主要反映单请求平均成本和改动前后对比
+- 当前 `BenchmarkShardKVRange` 使用 `Range("a", "a~", 0)`，在现有 `key2shard` 映射下主要命中单 shard，所以更适合观察单 shard 范围扫描路径，而不是跨 shard fan-out 成本
 - `BenchmarkShardKVPutParallel` 是并发 benchmark，反映多 worker 同时打 3 节点集群时的顺序 `Put` 吞吐
 - 真正回答“并发写吞吐”时，仍建议同时引用 `TestResumeWriteThroughputLocal` 这类可控多 worker 压测
 
@@ -171,7 +173,9 @@ Benchmark 方法说明：
 - `BenchmarkShardKVPut`：`144.1 ops/s`
 - `BenchmarkShardKVPutParallel`：`451.5 ops/s`
 - `BenchmarkShardKVGet`：`14637 ops/s`
-- `BenchmarkShardKVRange`：`165.3 ops/s`
+- `BenchmarkShardKVRange`：`283.6 ops/s`
+
+其中最近一轮 `Range` 优化后，`BenchmarkShardKVRange` 从约 `165.3 ops/s` 提升到 `283.6 ops/s`，同时 `B/op` 从约 `4.0 MB` 降到 `2.44 MB`，`allocs/op` 从约 `49k` 降到 `25k`。
 
 ## 备注
 - 测试仍基于 `labrpc`（网络可控），但已支持 gRPC 传输作为内部 RPC

@@ -199,14 +199,11 @@ func (kv *ShardKV) fastRange(start, end string, limit, shard int, rpcID int64) (
 		return 0
 	}
 
-	startIt, endIt, ok := engine.LsmItersMonotonyPredicate(uint64(readIndex), pred)
-	if !ok || startIt == nil {
+	startIt := engine.ScanFrom(uint64(readIndex), start)
+	if startIt == nil {
 		return OpResult{Err: OK, RPCID: rpcID, KVs: nil}, true
 	}
 	defer startIt.Close()
-	if endIt != nil {
-		defer endIt.Close()
-	}
 
 	out := make([]KeyValue, 0)
 	for startIt.Valid() {
@@ -478,16 +475,13 @@ func (kv *ShardKV) TxnRange(args *TxnRangeArgs, reply *TxnRangeReply) {
 		return 0
 	}
 
-	startIt, endIt, ok := engine.LsmItersMonotonyPredicate(args.Snapshot, pred)
-	if !ok || startIt == nil {
+	startIt := engine.ScanFrom(args.Snapshot, start)
+	if startIt == nil {
 		reply.Err = OK
 		reply.KVs = nil
 		return
 	}
 	defer startIt.Close()
-	if endIt != nil {
-		defer endIt.Close()
-	}
 
 	out := make([]TxnRangeKV, 0)
 	for startIt.Valid() {
@@ -732,16 +726,13 @@ func (kv *ShardKV) applyRange(op Op, index int) OpResult {
 		return 0
 	}
 
-	startIt, endIt, ok := engine.LsmItersMonotonyPredicate(uint64(index), pred)
-	if !ok || startIt == nil {
+	startIt := engine.ScanFrom(uint64(index), start)
+	if startIt == nil {
 		res := OpResult{Err: OK, RPCID: op.RPCID, KVs: nil}
 		kv.lastOps[op.ClientID] = res
 		return res
 	}
 	defer startIt.Close()
-	if endIt != nil {
-		defer endIt.Close()
-	}
 
 	out := make([]KeyValue, 0)
 	for startIt.Valid() {
@@ -1032,14 +1023,11 @@ func (kv *ShardKV) exportShardDataAt(engine *lsm.LSMEngine, snapshot uint64) map
 	if engine == nil {
 		return out
 	}
-	start, end, ok := engine.LsmItersMonotonyPredicate(snapshot, func(string) int { return 0 })
-	if !ok || start == nil {
+	start := engine.ScanFrom(snapshot, "")
+	if start == nil {
 		return out
 	}
 	defer start.Close()
-	if end != nil {
-		defer end.Close()
-	}
 	for start.Valid() {
 		k := start.Key()
 		v, ok := decodeValue(start.Value())

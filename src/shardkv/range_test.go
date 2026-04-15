@@ -5,6 +5,51 @@ import (
 	"testing"
 )
 
+func TestRangeTargetShards(t *testing.T) {
+	tests := []struct {
+		name  string
+		start string
+		end   string
+		want  []int
+	}{
+		{
+			name:  "single shard same prefix",
+			start: "a",
+			end:   "a~",
+			want:  []int{key2shard("a")},
+		},
+		{
+			name:  "single shard next prefix upper bound",
+			start: "a",
+			end:   "b",
+			want:  []int{key2shard("a")},
+		},
+		{
+			name:  "cross shard byte range",
+			start: "a",
+			end:   "e",
+			want: []int{
+				key2shard("a"),
+				key2shard("b"),
+				key2shard("c"),
+				key2shard("d"),
+			},
+		},
+		{
+			name:  "empty range",
+			start: "z",
+			end:   "a",
+			want:  nil,
+		},
+	}
+
+	for _, tt := range tests {
+		if got := rangeTargetShards(tt.start, tt.end); !reflect.DeepEqual(got, tt.want) {
+			t.Fatalf("%s: got %v want %v", tt.name, got, tt.want)
+		}
+	}
+}
+
 func TestRangeSingleShard(t *testing.T) {
 	cfg := make_config(t, 3, false, -1)
 	defer cfg.cleanup()

@@ -34,6 +34,50 @@ func Key2ShardForExternal(key string) int {
 	return key2shard(key)
 }
 
+func rangeTargetShards(start, end string) []int {
+	if end != "" && start >= end {
+		return nil
+	}
+
+	seen := make([]bool, shardctrler.NShards)
+	out := make([]int, 0, shardctrler.NShards)
+	addShard := func(b byte) {
+		shard := int(b) % shardctrler.NShards
+		if !seen[shard] {
+			seen[shard] = true
+			out = append(out, shard)
+		}
+	}
+
+	lower := 0
+	if len(start) > 0 {
+		lower = int(start[0])
+	}
+
+	upper := 255
+	includeUpper := true
+	if len(end) > 0 {
+		upper = int(end[0])
+		includeUpper = len(end) > 1
+	}
+
+	if lower > upper {
+		return nil
+	}
+
+	for b := lower; b <= upper; b++ {
+		if len(end) > 0 && b == upper && !includeUpper {
+			break
+		}
+		addShard(byte(b))
+	}
+
+	if len(out) == 0 && len(start) > 0 {
+		addShard(start[0])
+	}
+	return out
+}
+
 func nrand() int64 {
 	max := big.NewInt(int64(1) << 62)
 	bigx, _ := rand.Int(rand.Reader, max)
@@ -109,6 +153,40 @@ func (ck *Clerk) forgetLeader(gid, serverIdx int) {
 	if hint, ok := ck.leaderHint[gid]; ok && hint == serverIdx {
 		delete(ck.leaderHint, gid)
 	}
+}
+
+func (ck *Clerk) rangeOnShard(cfg shardctrler.Config, shard int, start, end string, limit int, rpcID int64) ([]KeyValue, bool, bool) {
+	gid := cfg.Shards[shard]
+	servers, ok := cfg.Groups[gid]
+	if !ok || gid == 0 || len(servers) == 0 {
+		return nil, false, true
+	}
+
+	args := RangeArgs{
+		Start:    start,
+		End:      end,
+		Limit:    limit,
+		ShardID:  shard,
+		ClientID: ck.ClientID,
+		RPCID:    rpcID,
+	}
+
+	for _, si := range ck.serverOrder(gid, len(servers)) {
+		srv := ck.makeEnd(servers[si])
+		var reply RangeReply
+		ok := srv.Call("ShardKV.Range", &args, &reply)
+		if ok && (reply.Err == OK || reply.Err == ErrNoKey || reply.Err == ErrRepeated) {
+			ck.rememberLeader(gid, si)
+			return reply.KVs, true, false
+		}
+		if ok && reply.Err == ErrWrongGroup {
+			ck.forgetLeader(gid, si)
+			return nil, false, true
+		}
+		ck.forgetLeader(gid, si)
+	}
+
+	return nil, false, false
 }
 
 // fetch the current value for a key.
@@ -204,59 +282,39 @@ func (ck *Clerk) Append(key string, value string) {
 // Range returns key/value pairs in [start, end) within the shard of start.
 // end == "" means open-ended. limit == 0 means no limit.
 func (ck *Clerk) Range(start, end string, limit int) []KeyValue {
+	targetShards := rangeTargetShards(start, end)
+	if len(targetShards) == 0 {
+		return nil
+	}
+
 	for {
 		cfg := ck.config
-		perShardRPC := make([]int64, shardctrler.NShards)
-		for i := 0; i < shardctrler.NShards; i++ {
-			perShardRPC[i] = ck.allocRPCID()
+		if len(targetShards) == 1 {
+			kvs, ok, needRefresh := ck.rangeOnShard(cfg, targetShards[0], start, end, limit, ck.allocRPCID())
+			if ok {
+				return kvs
+			}
+			if !needRefresh {
+				time.Sleep(100 * time.Millisecond)
+			}
+			ck.refreshConfig()
+			continue
 		}
 
 		all := make([]KeyValue, 0)
 		needRefresh := false
 
-		for shard := 0; shard < shardctrler.NShards; shard++ {
-			gid := cfg.Shards[shard]
-			servers, ok := cfg.Groups[gid]
-			if !ok || gid == 0 || len(servers) == 0 {
+		for _, shard := range targetShards {
+			kvs, ok, refresh := ck.rangeOnShard(cfg, shard, start, end, 0, ck.allocRPCID())
+			if refresh {
 				needRefresh = true
 				break
 			}
-
-			args := RangeArgs{
-				Start:    start,
-				End:      end,
-				Limit:    0, // global limit will be applied after merge
-				ShardID:  shard,
-				ClientID: ck.ClientID,
-				RPCID:    perShardRPC[shard],
-			}
-
-			got := false
-			for _, si := range ck.serverOrder(gid, len(servers)) {
-				srv := ck.makeEnd(servers[si])
-				var reply RangeReply
-				ok := srv.Call("ShardKV.Range", &args, &reply)
-				if ok && (reply.Err == OK || reply.Err == ErrNoKey || reply.Err == ErrRepeated) {
-					ck.rememberLeader(gid, si)
-					all = append(all, reply.KVs...)
-					got = true
-					break
-				}
-				if ok && reply.Err == ErrWrongGroup {
-					ck.forgetLeader(gid, si)
-					needRefresh = true
-					break
-				}
-				ck.forgetLeader(gid, si)
-			}
-
-			if needRefresh {
-				break
-			}
-			if !got {
+			if !ok {
 				needRefresh = true
 				break
 			}
+			all = append(all, kvs...)
 		}
 
 		if !needRefresh {
