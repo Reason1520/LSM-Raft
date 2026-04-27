@@ -3,6 +3,8 @@ package shardkv
 import (
 	"context"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"6.5840/shardkvpb"
 )
@@ -10,11 +12,12 @@ import (
 // GRPCServer exposes shardkv APIs over gRPC.
 type GRPCServer struct {
 	shardkvpb.UnimplementedShardKVServer
-	pool sync.Pool
+	pool    sync.Pool
+	metrics *shardKVMetrics
 }
 
 func NewGRPCServer(ck *Clerk) *GRPCServer {
-	s := &GRPCServer{}
+	s := &GRPCServer{metrics: &shardKVMetrics{}}
 	s.pool.New = func() interface{} {
 		return ck.Clone()
 	}
@@ -28,6 +31,17 @@ func (s *GRPCServer) getClerk() *Clerk {
 
 func (s *GRPCServer) putClerk(ck *Clerk) {
 	s.pool.Put(ck)
+}
+
+func (s *GRPCServer) MetricsSnapshot() ShardKVMetricsSnapshot {
+	return ShardKVMetricsSnapshot{
+		GRPCGetCount:   atomic.LoadUint64(&s.metrics.grpcGetCount),
+		GRPCGetTotal:   time.Duration(atomic.LoadUint64(&s.metrics.grpcGetTotalNS)),
+		GRPCPutCount:   atomic.LoadUint64(&s.metrics.grpcPutCount),
+		GRPCPutTotal:   time.Duration(atomic.LoadUint64(&s.metrics.grpcPutTotalNS)),
+		GRPCRangeCount: atomic.LoadUint64(&s.metrics.grpcRangeCount),
+		GRPCRangeTotal: time.Duration(atomic.LoadUint64(&s.metrics.grpcRangeTotalNS)),
+	}
 }
 
 func toIsolation(level shardkvpb.IsolationLevel) IsolationLevel {
@@ -53,6 +67,10 @@ func errString(e Err) string {
 }
 
 func (s *GRPCServer) Get(ctx context.Context, req *shardkvpb.GetRequest) (*shardkvpb.GetResponse, error) {
+	start := time.Now()
+	defer func() {
+		s.metrics.observeGRPCGet(time.Since(start))
+	}()
 	ck := s.getClerk()
 	defer s.putClerk(ck)
 	val, err := ck.GetWithErr(req.Key)
@@ -60,6 +78,10 @@ func (s *GRPCServer) Get(ctx context.Context, req *shardkvpb.GetRequest) (*shard
 }
 
 func (s *GRPCServer) Put(ctx context.Context, req *shardkvpb.PutRequest) (*shardkvpb.PutResponse, error) {
+	start := time.Now()
+	defer func() {
+		s.metrics.observeGRPCPut(time.Since(start))
+	}()
 	ck := s.getClerk()
 	defer s.putClerk(ck)
 	ck.Put(req.Key, req.Value)
@@ -67,6 +89,10 @@ func (s *GRPCServer) Put(ctx context.Context, req *shardkvpb.PutRequest) (*shard
 }
 
 func (s *GRPCServer) Append(ctx context.Context, req *shardkvpb.AppendRequest) (*shardkvpb.AppendResponse, error) {
+	start := time.Now()
+	defer func() {
+		s.metrics.observeGRPCPut(time.Since(start))
+	}()
 	ck := s.getClerk()
 	defer s.putClerk(ck)
 	ck.Append(req.Key, req.Value)
@@ -74,6 +100,10 @@ func (s *GRPCServer) Append(ctx context.Context, req *shardkvpb.AppendRequest) (
 }
 
 func (s *GRPCServer) Range(ctx context.Context, req *shardkvpb.RangeRequest) (*shardkvpb.RangeResponse, error) {
+	start := time.Now()
+	defer func() {
+		s.metrics.observeGRPCRange(time.Since(start))
+	}()
 	ck := s.getClerk()
 	defer s.putClerk(ck)
 	kvs := ck.Range(req.Start, req.End, int(req.Limit))

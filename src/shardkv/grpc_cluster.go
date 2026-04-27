@@ -124,6 +124,17 @@ func StartGRPCCluster(groupN int) (*GRPCCluster, *Clerk) {
 	return gc, ck
 }
 
+func (gc *GRPCCluster) ServerMetrics() []ShardKVMetricsSnapshot {
+	out := make([]ShardKVMetricsSnapshot, 0, len(gc.groupServer))
+	for _, srv := range gc.groupServer {
+		if srv == nil {
+			continue
+		}
+		out = append(out, srv.MetricsSnapshot())
+	}
+	return out
+}
+
 // Close stops all servers and gRPC listeners.
 func (gc *GRPCCluster) Close() {
 	for i := 0; i < len(gc.groupServer); i++ {

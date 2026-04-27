@@ -92,7 +92,11 @@ type ShardKV struct {
 
 	lastOps map[int64]OpResult
 
-	waitCh map[int]chan OpResult
+	waitCh         map[int]chan OpResult
+	readyResult    map[int]OpResult
+	proposalTraces map[int]proposalTrace
+	applyNotify    chan struct{}
+	metrics        *shardKVMetrics
 
 	nextTxnID         uint64
 	nextInternalRPCID int64
@@ -138,7 +142,22 @@ func (kv *ShardKV) waitAppliedLocked(index int, deadline time.Time) bool {
 			kv.mu.Lock()
 			return false
 		}
-		time.Sleep(10 * time.Millisecond)
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			kv.mu.Lock()
+			return false
+		}
+		timer := time.NewTimer(remaining)
+		select {
+		case <-kv.applyNotify:
+		case <-timer.C:
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 		kv.mu.Lock()
 	}
 	return true
@@ -151,18 +170,23 @@ func (kv *ShardKV) getSafeReadIndex() (int, bool) {
 func (kv *ShardKV) fastGet(key string, rpcID int64) (OpResult, bool) {
 	readIndex, ok := kv.getSafeReadIndex()
 	if !ok {
+		kv.metrics.incLeaseReadFallbackRaft()
 		return OpResult{}, false
 	}
+	kv.metrics.incLeaseReadOK()
 
 	deadline := time.Now().Add(300 * time.Millisecond)
 	shard := key2shard(key)
 
+	waitStart := time.Now()
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	if !kv.waitAppliedLocked(readIndex, deadline) {
+		kv.metrics.observeLeaseReadWaitApply(time.Since(waitStart))
 		return OpResult{Err: ErrTimeout, RPCID: rpcID}, true
 	}
+	kv.metrics.observeLeaseReadWaitApply(time.Since(waitStart))
 	if !kv.canServe(shard) {
 		return OpResult{Err: ErrWrongGroup, RPCID: rpcID}, true
 	}
@@ -171,7 +195,9 @@ func (kv *ShardKV) fastGet(key string, rpcID int64) (OpResult, bool) {
 	if engine == nil {
 		return OpResult{Err: ErrNoKey, RPCID: rpcID}, true
 	}
+	lsmStart := time.Now()
 	enc, _ := engine.Get(key, uint64(readIndex))
+	kv.metrics.observeLSMGet(time.Since(lsmStart))
 	val, ok := decodeValue(enc)
 	if !ok {
 		return OpResult{Err: ErrNoKey, RPCID: rpcID}, true
@@ -182,20 +208,25 @@ func (kv *ShardKV) fastGet(key string, rpcID int64) (OpResult, bool) {
 func (kv *ShardKV) fastRange(start, end string, limit, shard int, rpcID int64) (OpResult, bool) {
 	readIndex, ok := kv.getSafeReadIndex()
 	if !ok {
+		kv.metrics.incLeaseReadFallbackRaft()
 		return OpResult{}, false
 	}
+	kv.metrics.incLeaseReadOK()
 
 	deadline := time.Now().Add(300 * time.Millisecond)
 	if limit < 0 {
 		limit = 0
 	}
 
+	waitStart := time.Now()
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
 	if !kv.waitAppliedLocked(readIndex, deadline) {
+		kv.metrics.observeLeaseReadWaitApply(time.Since(waitStart))
 		return OpResult{Err: ErrTimeout, RPCID: rpcID}, true
 	}
+	kv.metrics.observeLeaseReadWaitApply(time.Since(waitStart))
 	if !kv.canServe(shard) {
 		return OpResult{Err: ErrWrongGroup, RPCID: rpcID}, true
 	}
@@ -219,6 +250,7 @@ func (kv *ShardKV) fastRange(start, end string, limit, shard int, rpcID int64) (
 	if startIt == nil {
 		return OpResult{Err: OK, RPCID: rpcID, KVs: nil}, true
 	}
+	lsmStart := time.Now()
 	defer startIt.Close()
 
 	out := make([]KeyValue, 0)
@@ -236,12 +268,19 @@ func (kv *ShardKV) fastRange(start, end string, limit, shard int, rpcID int64) (
 		startIt.Next()
 	}
 
+	kv.metrics.observeLSMRange(time.Since(lsmStart))
 	return OpResult{Err: OK, RPCID: rpcID, KVs: out}, true
 }
 
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
+	start := time.Now()
+	defer func() {
+		kv.metrics.observeGetHandler(time.Since(start))
+	}()
 	shard := key2shard(args.Key)
+	lockStart := time.Now()
 	kv.mu.Lock()
+	kv.metrics.observeGetLockWait(time.Since(lockStart))
 	if !kv.canServe(shard) {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
@@ -268,8 +307,14 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 }
 
 func (kv *ShardKV) Range(args *RangeArgs, reply *RangeReply) {
+	start := time.Now()
+	defer func() {
+		kv.metrics.observeRangeHandler(time.Since(start))
+	}()
 	shard := args.ShardID
+	lockStart := time.Now()
 	kv.mu.Lock()
+	kv.metrics.observeRangeLockWait(time.Since(lockStart))
 	if !kv.canServe(shard) {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
@@ -299,8 +344,14 @@ func (kv *ShardKV) Range(args *RangeArgs, reply *RangeReply) {
 }
 
 func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	start := time.Now()
+	defer func() {
+		kv.metrics.observePutHandler(time.Since(start))
+	}()
 	shard := key2shard(args.Key)
+	lockStart := time.Now()
 	kv.mu.Lock()
+	kv.metrics.observePutLockWait(time.Since(lockStart))
 	if !kv.canServe(shard) {
 		reply.Err = ErrWrongGroup
 		kv.mu.Unlock()
@@ -770,19 +821,30 @@ func (kv *ShardKV) TxnRange(args *TxnRangeArgs, reply *TxnRangeReply) {
 
 // startOp submits an Op to Raft and waits for its result.
 func (kv *ShardKV) startOp(op Op) OpResult {
+	startedAt := time.Now()
 	index, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		return OpResult{Err: ErrWrongLeader}
+	}
+	if op.Type == GET || op.Type == RANGE {
+		kv.metrics.incRaftRead()
 	}
 
 	kv.mu.Lock()
 	ch := make(chan OpResult, 1)
 	kv.waitCh[index] = ch
+	if ready, ok := kv.readyResult[index]; ok {
+		delete(kv.readyResult, index)
+		ch <- ready
+	} else {
+		kv.proposalTraces[index] = proposalTrace{opType: op.Type, startedAt: startedAt}
+	}
 	kv.mu.Unlock()
 
 	defer func() {
 		kv.mu.Lock()
 		delete(kv.waitCh, index)
+		delete(kv.readyResult, index)
 		kv.mu.Unlock()
 	}()
 
@@ -790,6 +852,12 @@ func (kv *ShardKV) startOp(op Op) OpResult {
 	case res := <-ch:
 		return res
 	case <-time.After(500 * time.Millisecond):
+		kv.mu.Lock()
+		if trace, ok := kv.proposalTraces[index]; ok {
+			trace.abandoned = true
+			kv.proposalTraces[index] = trace
+		}
+		kv.mu.Unlock()
 		return OpResult{Err: ErrTimeout}
 	}
 }
@@ -923,9 +991,32 @@ func (kv *ShardKV) applier() {
 
 			kv.lastApplied = index
 			kv.updateGCWatermarkLocked()
+			select {
+			case kv.applyNotify <- struct{}{}:
+			default:
+			}
+			abandoned := false
+			if trace, ok := kv.proposalTraces[index]; ok {
+				abandoned = trace.abandoned
+				if msg.CommitTime > 0 {
+					commitAt := time.Unix(0, msg.CommitTime)
+					startToCommit := commitAt.Sub(trace.startedAt)
+					commitToApply := time.Since(commitAt)
+					if (op.Type == PUT || op.Type == APPEND) && startToCommit >= 0 {
+						kv.metrics.observePutRaftCommit(startToCommit)
+						kv.metrics.observePutApplyWait(commitToApply)
+					}
+				}
+				delete(kv.proposalTraces, index)
+			}
 
 			if ch, ok := kv.waitCh[index]; ok {
 				ch <- res
+			} else {
+				kv.metrics.incWaitChMiss()
+				if !abandoned {
+					kv.readyResult[index] = res
+				}
 			}
 			kv.mu.Unlock()
 		} else if msg.SnapshotValid {
@@ -933,6 +1024,10 @@ func (kv *ShardKV) applier() {
 			kv.readSnapshot(msg.Snapshot)
 			kv.lastApplied = msg.SnapshotIndex
 			kv.updateGCWatermarkLocked()
+			select {
+			case kv.applyNotify <- struct{}{}:
+			default:
+			}
 			kv.mu.Unlock()
 		}
 	}
@@ -953,11 +1048,17 @@ func (kv *ShardKV) applyPutAppend(op Op, index int) OpResult {
 	engine := kv.ensureShardEngine(shard)
 	trancID := uint64(index)
 	if op.Type == PUT {
+		lsmStart := time.Now()
 		engine.Put(op.Key, encodeValue(op.Value), trancID)
+		kv.metrics.observeLSMPut(time.Since(lsmStart))
 	} else {
+		lsmGetStart := time.Now()
 		curEnc, _ := engine.Get(op.Key, 0)
+		kv.metrics.observeLSMGet(time.Since(lsmGetStart))
 		curVal, _ := decodeValue(curEnc)
+		lsmPutStart := time.Now()
 		engine.Put(op.Key, encodeValue(curVal+op.Value), trancID)
+		kv.metrics.observeLSMPut(time.Since(lsmPutStart))
 	}
 
 	res := OpResult{Err: OK, RPCID: op.RPCID}
@@ -975,7 +1076,9 @@ func (kv *ShardKV) applyGet(op Op) OpResult {
 	if engine == nil {
 		return OpResult{Err: ErrNoKey, RPCID: op.RPCID}
 	}
+	lsmStart := time.Now()
 	enc, _ := engine.Get(op.Key, 0)
+	kv.metrics.observeLSMGet(time.Since(lsmStart))
 	val, ok := decodeValue(enc)
 	if !ok {
 		return OpResult{Err: ErrNoKey, RPCID: op.RPCID}
@@ -1023,6 +1126,7 @@ func (kv *ShardKV) applyRange(op Op, index int) OpResult {
 		kv.lastOps[op.ClientID] = res
 		return res
 	}
+	lsmStart := time.Now()
 	defer startIt.Close()
 
 	out := make([]KeyValue, 0)
@@ -1041,6 +1145,7 @@ func (kv *ShardKV) applyRange(op Op, index int) OpResult {
 	}
 
 	res := OpResult{Err: OK, RPCID: op.RPCID, KVs: out}
+	kv.metrics.observeLSMRange(time.Since(lsmStart))
 	kv.lastOps[op.ClientID] = res
 	return res
 }
@@ -2181,6 +2286,10 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.shardStatus = make(map[int]int)
 	kv.lastOps = make(map[int64]OpResult)
 	kv.waitCh = make(map[int]chan OpResult)
+	kv.readyResult = make(map[int]OpResult)
+	kv.proposalTraces = make(map[int]proposalTrace)
+	kv.applyNotify = make(chan struct{}, 1)
+	kv.metrics = &shardKVMetrics{}
 	kv.activeTxn = make(map[uint64]uint64)
 	kv.activeTxnLast = make(map[uint64]time.Time)
 	kv.coordTxns = make(map[uint64]CoordTxnRecord)

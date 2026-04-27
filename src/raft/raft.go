@@ -75,6 +75,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommitTime   int64
 
 	// For 3D:
 	SnapshotValid bool
@@ -131,6 +132,26 @@ type Raft struct {
 	replicateCh []chan struct{} // per-follower replication triggers
 	peerAckTerm []int
 	peerAckTime []time.Time
+	commitTimes map[int]int64
+
+	persistCount                uint64
+	persistTimeNS               uint64
+	startCount                  uint64
+	startTimeNS                 uint64
+	leaderPersistCount          uint64
+	leaderPersistTimeNS         uint64
+	appendRPCCount              uint64
+	appendRPCTimeNS             uint64
+	appendDataRPCCount          uint64
+	appendDataRPCTimeNS         uint64
+	followerAppendCount         uint64
+	followerAppendTimeNS        uint64
+	followerAppendPersistCount  uint64
+	followerAppendPersistTimeNS uint64
+	majorityAckCount            uint64
+	majorityAckTimeNS           uint64
+	applySendCount              uint64
+	applySendTimeNS             uint64
 }
 
 // return currentTerm and whether this server
@@ -157,11 +178,13 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 
 func (rf *Raft) persist(persistSnapshot bool, snapshot []byte) {
+	start := time.Now()
 	if persistSnapshot {
 		rf.persister.Save(rf.encodeState(), snapshot)
 	} else {
 		rf.persister.SaveRaftState(rf.encodeState())
 	}
+	rf.observePersist(time.Since(start))
 }
 
 // restore previously persisted state.
@@ -415,6 +438,13 @@ type AppendEntriesReply struct {
 
 // AppendEntries : 复制日志
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	appendStart := time.Now()
+	hasEntries := len(args.Entries) > 0
+	if hasEntries {
+		defer func() {
+			rf.observeFollowerAppend(time.Since(appendStart))
+		}()
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -524,7 +554,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if conflictFound {
 		rf.log = append(rf.log, args.Entries[startAppendIdx:]...)
+		persistStart := time.Now()
 		rf.persist(false, nil)
+		rf.observeFollowerAppendPersist(time.Since(persistStart))
 	}
 
 	// 修改commitIndex
@@ -574,7 +606,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	start := time.Now()
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	elapsed := time.Since(start)
+	rf.observeAppendRPC(elapsed)
+	if len(args.Entries) > 0 {
+		rf.observeAppendDataRPC(elapsed)
+	}
 	return ok
 }
 
@@ -723,6 +761,13 @@ func (rf *Raft) updateCommitIndex() {
 		}
 
 		if count > len(rf.peers)/2 {
+			if _, ok := rf.commitTimes[n]; !ok {
+				commitAt := time.Now().UnixNano()
+				rf.commitTimes[n] = commitAt
+				if startAt := rf.getLogTimestamp(n); startAt > 0 && commitAt >= startAt {
+					rf.observeMajorityAck(time.Duration(commitAt - startAt))
+				}
+			}
 			rf.commitIndex = n
 		}
 	}
@@ -873,8 +918,12 @@ func (rf *Raft) replicator(server int) {
 }
 
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
+	start := time.Now()
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer func() {
+		rf.observeStart(time.Since(start))
+	}()
 
 	if rf.role != LEADER {
 		return -1, -1, false
@@ -890,10 +939,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command:   command,
 		TimeStamp: time.Now().UnixNano(),
 	})
+	persistStart := time.Now()
 	rf.persist(false, nil)
+	rf.observeLeaderPersist(time.Since(persistStart))
 
 	// Single-node cluster: commit immediately.
 	if len(rf.peers) == 1 {
+		commitAt := time.Now().UnixNano()
+		rf.commitTimes[index] = commitAt
+		if commitAt >= rf.log[len(rf.log)-1].TimeStamp {
+			rf.observeMajorityAck(time.Duration(commitAt - rf.log[len(rf.log)-1].TimeStamp))
+		}
 		rf.commitIndex = index
 		rf.applyCond.Broadcast()
 	}
@@ -1028,6 +1084,14 @@ func (rf *Raft) getLogTerm(globalIndex int) int {
 	return rf.log[sliceIndex].Term
 }
 
+func (rf *Raft) getLogTimestamp(globalIndex int) int64 {
+	sliceIndex := globalIndex - rf.lastIncludedIndex
+	if sliceIndex < 0 || sliceIndex >= len(rf.log) {
+		return 0
+	}
+	return rf.log[sliceIndex].TimeStamp
+}
+
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -1111,6 +1175,7 @@ func (rf *Raft) applier() {
 					CommandValid: true,
 					Command:      rf.log[sliceIdx].Command,
 					CommandIndex: i,
+					CommitTime:   rf.commitTimes[i],
 				}
 				entries = append(entries, msg)
 			}
@@ -1118,12 +1183,15 @@ func (rf *Raft) applier() {
 		rf.mu.Unlock()
 
 		for _, msg := range entries {
+			sendStart := time.Now()
 			rf.applyChannel <- msg
+			rf.observeApplySend(time.Since(sendStart))
 			rf.mu.Lock()
 			// 更新 lastApplied，防止重入
 			if msg.CommandIndex > rf.lastApplied {
 				rf.lastApplied = msg.CommandIndex
 			}
+			delete(rf.commitTimes, msg.CommandIndex)
 			rf.mu.Unlock()
 		}
 	}
@@ -1170,6 +1238,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.replicateCh = make([]chan struct{}, len(peers))
 	rf.peerAckTerm = make([]int, len(peers))
 	rf.peerAckTime = make([]time.Time, len(peers))
+	rf.commitTimes = make(map[int]int64)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 

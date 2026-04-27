@@ -201,6 +201,17 @@ func (dc *DemoCluster) NewClerk() *Clerk {
 	return ck
 }
 
+func (dc *DemoCluster) ServerMetrics() []ShardKVMetricsSnapshot {
+	out := make([]ShardKVMetricsSnapshot, 0, len(dc.groupServers))
+	for _, srv := range dc.groupServers {
+		if srv == nil {
+			continue
+		}
+		out = append(out, srv.MetricsSnapshot())
+	}
+	return out
+}
+
 // Close stops all servers and cleans up the network.
 func (dc *DemoCluster) Close() {
 	for i := 0; i < len(dc.groupServers); i++ {
