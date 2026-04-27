@@ -12,11 +12,14 @@ type Txn struct {
 	isolation IsolationLevel
 	snapshot  uint64
 	shard     int
+	gid       int
 	started   bool
 	invalid   bool
 
 	writes map[string]*string
 	reads  map[string]uint64
+
+	groupServers []string
 }
 
 // BeginTxn starts a new transaction (lazy begin on first key access).
@@ -40,9 +43,14 @@ func (tx *Txn) ensureBegin(key string) bool {
 		return true
 	}
 	txnID, snapshot := tx.ck.txnBeginOnShard(shard, tx.isolation)
+	cfg := tx.ck.currentConfig()
+	gid := cfg.Shards[shard]
+	servers := append([]string(nil), cfg.Groups[gid]...)
 	tx.shard = shard
+	tx.gid = gid
 	tx.txnID = txnID
 	tx.snapshot = snapshot
+	tx.groupServers = servers
 	tx.started = true
 	return true
 }
@@ -163,6 +171,7 @@ func (tx *Txn) Range(start, end string, limit int) ([]KeyValue, bool) {
 // Commit submits the transaction as a single Raft log entry.
 func (tx *Txn) Commit() bool {
 	if tx.invalid {
+		tx.Abort()
 		return false
 	}
 	if !tx.started && len(tx.writes) == 0 && len(tx.reads) == 0 {
@@ -203,10 +212,24 @@ func (tx *Txn) Commit() bool {
 	return false
 }
 
+func (tx *Txn) abortRemote() {
+	if !tx.started || tx.txnID == 0 || tx.gid == 0 || len(tx.groupServers) == 0 {
+		return
+	}
+	tx.ck.txnAbortOnServers(tx.gid, tx.groupServers, tx.txnID)
+}
+
 // Abort discards buffered operations.
 func (tx *Txn) Abort() {
+	tx.abortRemote()
 	tx.writes = make(map[string]*string)
 	tx.reads = make(map[string]uint64)
+	tx.started = false
+	tx.txnID = 0
+	tx.snapshot = 0
+	tx.gid = 0
+	tx.groupServers = nil
+	tx.invalid = true
 }
 
 func (ck *Clerk) txnBeginOnShard(shard int, level IsolationLevel) (uint64, uint64) {
@@ -216,8 +239,9 @@ func (ck *Clerk) txnBeginOnShard(shard int, level IsolationLevel) (uint64, uint6
 		Isolation: level,
 	}
 	for {
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
+		cfg := ck.currentConfig()
+		gid := cfg.Shards[shard]
+		if servers, ok := cfg.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.makeEnd(servers[si])
 				var reply TxnBeginReply
@@ -230,7 +254,7 @@ func (ck *Clerk) txnBeginOnShard(shard int, level IsolationLevel) (uint64, uint6
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		ck.config = ck.sm.Query(-1)
+		ck.refreshConfig()
 	}
 }
 
@@ -243,8 +267,9 @@ func (ck *Clerk) txnGetOnShard(shard int, key string, snapshot uint64, txnID uin
 		RPCID:    ck.allocRPCID(),
 	}
 	for {
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
+		cfg := ck.currentConfig()
+		gid := cfg.Shards[shard]
+		if servers, ok := cfg.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.makeEnd(servers[si])
 				var reply TxnGetReply
@@ -258,14 +283,15 @@ func (ck *Clerk) txnGetOnShard(shard int, key string, snapshot uint64, txnID uin
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		ck.config = ck.sm.Query(-1)
+		ck.refreshConfig()
 	}
 }
 
 func (ck *Clerk) txnCommitOnShard(shard int, args *TxnCommitArgs) Err {
 	for {
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
+		cfg := ck.currentConfig()
+		gid := cfg.Shards[shard]
+		if servers, ok := cfg.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.makeEnd(servers[si])
 				var reply TxnCommitReply
@@ -279,8 +305,80 @@ func (ck *Clerk) txnCommitOnShard(shard int, args *TxnCommitArgs) Err {
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		ck.config = ck.sm.Query(-1)
+		ck.refreshConfig()
 	}
+}
+
+func (ck *Clerk) txnAbortOnServers(gid int, servers []string, txnID uint64) Err {
+	if txnID == 0 || gid == 0 || len(servers) == 0 {
+		return OK
+	}
+	args := TxnAbortArgs{
+		TxnID:    txnID,
+		ClientID: ck.ClientID,
+		RPCID:    ck.allocRPCID(),
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		sawReply := false
+		for _, si := range ck.serverOrder(gid, len(servers)) {
+			srv := ck.makeEnd(servers[si])
+			var reply TxnAbortReply
+			ok := srv.Call("ShardKV.TxnAbort", &args, &reply)
+			if ok {
+				sawReply = true
+				ck.rememberLeader(gid, si)
+				continue
+			}
+			ck.forgetLeader(gid, si)
+		}
+		if sawReply {
+			return OK
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return ErrTimeout
+}
+
+func (ck *Clerk) txnAbortEverywhere(txnID uint64) Err {
+	if txnID == 0 {
+		return OK
+	}
+	cfg := ck.currentConfig()
+	if len(cfg.Groups) == 0 {
+		ck.refreshConfig()
+		cfg = ck.currentConfig()
+	}
+	args := TxnAbortArgs{
+		TxnID:    txnID,
+		ClientID: ck.ClientID,
+		RPCID:    ck.allocRPCID(),
+	}
+	for attempt := 0; attempt < 3; attempt++ {
+		sawReply := false
+		cfg = ck.currentConfig()
+		for gid, servers := range cfg.Groups {
+			if gid == 0 || len(servers) == 0 {
+				continue
+			}
+			for _, si := range ck.serverOrder(gid, len(servers)) {
+				srv := ck.makeEnd(servers[si])
+				var reply TxnAbortReply
+				ok := srv.Call("ShardKV.TxnAbort", &args, &reply)
+				if ok {
+					sawReply = true
+					ck.rememberLeader(gid, si)
+					continue
+				}
+				ck.forgetLeader(gid, si)
+			}
+		}
+		if sawReply {
+			return OK
+		}
+		time.Sleep(50 * time.Millisecond)
+		ck.refreshConfig()
+	}
+	return ErrTimeout
 }
 
 func (ck *Clerk) txnRangeOnShard(shard int, start, end string, limit int, snapshot uint64, txnID uint64) ([]TxnRangeKV, Err) {
@@ -295,8 +393,9 @@ func (ck *Clerk) txnRangeOnShard(shard int, start, end string, limit int, snapsh
 		RPCID:    ck.allocRPCID(),
 	}
 	for {
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
+		cfg := ck.currentConfig()
+		gid := cfg.Shards[shard]
+		if servers, ok := cfg.Groups[gid]; ok {
 			for si := 0; si < len(servers); si++ {
 				srv := ck.makeEnd(servers[si])
 				var reply TxnRangeReply
@@ -310,6 +409,6 @@ func (ck *Clerk) txnRangeOnShard(shard int, start, end string, limit int, snapsh
 			}
 		}
 		time.Sleep(100 * time.Millisecond)
-		ck.config = ck.sm.Query(-1)
+		ck.refreshConfig()
 	}
 }

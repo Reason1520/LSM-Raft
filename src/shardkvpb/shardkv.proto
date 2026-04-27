@@ -13,6 +13,7 @@ service ShardKV {
   rpc TxnBegin(TxnBeginRequest) returns (TxnBeginResponse);
   rpc TxnGet(TxnGetRequest) returns (TxnGetResponse);
   rpc TxnRange(TxnRangeRequest) returns (TxnRangeResponse);
+  rpc TxnAbort(TxnGetRequest) returns (TxnCommitResponse);
   rpc TxnCommit(TxnCommitRequest) returns (TxnCommitResponse);
 }
 

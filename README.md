@@ -1,6 +1,6 @@
 ﻿# ShardKV + LSMTree 项目说明
 
-本项目实现了一个基于 **Raft + LSM-Tree** 的分片 KV 数据库，并在 `shardkv` 层支持**单 shard 事务**。  
+本项目实现了一个基于 **Raft + LSM-Tree** 的分片 KV 数据库，并在 `shardkv` 层支持**单 shard 事务、内部跨 shard 一致性只读事务，以及基于 2PC + Raft 的跨 shard 写事务**。  
 内部 RPC 传输**可选**：`labrpc`（测试/内存网络）或 **gRPC 传输层**（真实网络），对外访问提供 gRPC 接口。  
 `shardkv` 基于 MIT 6.5840 的 lab5 改进，LSM 参考 https://github.com/Vanilla-Beauty/tiny-lsm 实现。
 
@@ -37,7 +37,9 @@ LSM-Tree (存储层)
 - 分片 KV（可迁移、快照）
 - LSM-Tree 存储（多层 SST + Compaction）
 - MVCC（版本号为 Raft 日志 index）
-- 单 shard 事务（ReadCommitted / RepeatableRead / Serializable）
+- 单 shard 读写事务（ReadCommitted / RepeatableRead / Serializable）
+- 内部 Clerk 支持跨 shard 一致性只读事务
+- 内部 Clerk 支持基于 2PC + Raft 的跨 shard 原子写事务
 - leader lease 普通只读快路径（Get/Range）
 - 范围查询（单 shard 线性一致，跨 shard 聚合）
 - gRPC 对外访问层（内部 RPC 可选 labrpc / gRPC 传输）
@@ -46,7 +48,7 @@ LSM-Tree (存储层)
 - **单 shard Get/Range**：线性一致；leader 优先走基于最近多数派确认的 lease read，本地按 `commitIndex` 快照读取，lease 不可用时回退到原 Raft 日志路径
 - **单 shard Put/Append**：线性一致（经 Raft 提交后写入状态机）
 - **跨 shard Range**：客户端逐 shard 查询并合并，不保证全局原子快照
-- **事务**：单 shard 内提交原子性；跨 shard 事务不支持
+- **事务**：单 shard 写事务使用“一次提交一条日志”；内部已支持跨 shard 一致性只读事务；内部 `shardkv.Clerk` 已支持基于 `2PC + Raft` 的跨 shard 原子写事务；对外 gRPC 事务接口暂时仍保持单 shard 模型
 
 ## LSM 存储说明
 - 每个 shard 对应一个 LSM 引擎实例
@@ -95,7 +97,9 @@ _ = tx.Put("a2", "v2")
 _, _ = tx.Range("a", "a~", 0)
 _ = tx.Commit()
 ```
-> `BeginTxn` 需要 `keyHint` 确定 shard；事务内 key 必须落在同一 shard。
+> `BeginTxn` 需要 `keyHint` 确定 shard；事务内 key 必须落在同一 shard。gRPC 客户端现在支持 `tx.Abort()`，在放弃事务或空事务场景下会主动释放服务端事务上下文。
+
+当前跨 shard 写事务仍是**内部 Clerk 能力**，对外 gRPC 尚未暴露独立的 cross-shard 事务 API。
 
 ## gRPC Proto
 `src/shardkvpb/shardkv.proto`
@@ -114,7 +118,7 @@ go test ./lsm -v
 
 常用回归：
 ```bash
-go test ./shardkv -run "TestSnapshot5B|TestTxn|TestRange" -count=1
+go test ./shardkv -run "TestSnapshot5B|TestTxn|TestRange|TestReadTxn|TestCrossShardTxn" -count=1
 go test ./raft -run "TestBasicAgree3B|TestRejoin3B" -count=1
 ```
 
@@ -180,4 +184,5 @@ Benchmark 方法说明：
 ## 备注
 - 测试仍基于 `labrpc`（网络可控），但已支持 gRPC 传输作为内部 RPC
 - 真正跨进程部署时，使用 gRPC 传输启动各节点即可
-- 跨 shard 事务需要额外协调协议（如 2PC）
+- 当前对外 gRPC 事务仍是单 shard 模型；跨 shard 一致性只读事务和跨 shard 2PC 写事务目前都在内部 `shardkv.Clerk` 层提供
+- 跨 shard 写事务当前采用 `2PC + Raft`，已补到 prepare/commit/abort、snapshot 恢复、迁移保护和决议自动重放，但更严格的全局 serializable 和对外 gRPC 暴露还没继续做

@@ -26,7 +26,7 @@ func resumeEnvInt(name string, def int) int {
 }
 
 func resumeWarmClient(ck *Clerk) {
-	ck.config = ck.sm.Query(-1)
+	ck.refreshConfig()
 }
 
 func resumeKey(tag string, i int) string {

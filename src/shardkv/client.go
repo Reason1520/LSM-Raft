@@ -13,6 +13,7 @@ import "crypto/rand"
 import "math/big"
 import "6.5840/shardctrler"
 import "sort"
+import "sync"
 import "sync/atomic"
 import "time"
 
@@ -86,13 +87,16 @@ func nrand() int64 {
 }
 
 type Clerk struct {
-	sm      *shardctrler.Clerk
-	config  shardctrler.Config
-	makeEnd func(string) *labrpc.ClientEnd
-	// You will have to modify this struct.
-	ClientID   int64
-	nextRPCID  int64
-	leaderHint map[int]int
+	mu             sync.RWMutex
+	sm             *shardctrler.Clerk
+	ctrlers        []*labrpc.ClientEnd
+	config         shardctrler.Config
+	makeEndFactory func(string) *labrpc.ClientEnd
+	endMu          sync.Mutex
+	ends           map[string]*labrpc.ClientEnd
+	ClientID       int64
+	nextRPCID      int64
+	leaderHint     map[int]int
 }
 
 // the tester calls MakeClerk.
@@ -106,13 +110,39 @@ type Clerk struct {
 func MakeClerk(ctrlers []*labrpc.ClientEnd, makeEnd func(string) *labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.sm = shardctrler.MakeClerk(ctrlers)
-	ck.makeEnd = makeEnd
-	// You'll have to add code here.
+	ck.ctrlers = ctrlers
+	ck.makeEndFactory = makeEnd
 	ck.ClientID = nrand()
 	ck.nextRPCID = 1
 	ck.leaderHint = make(map[int]int)
+	ck.ends = make(map[string]*labrpc.ClientEnd)
 	ck.refreshConfig()
 	return ck
+}
+
+func (ck *Clerk) Clone() *Clerk {
+	cfg := ck.currentConfig()
+	leaderHint := ck.snapshotLeaderHint()
+	clone := &Clerk{
+		sm:             shardctrler.MakeClerk(ck.ctrlers),
+		ctrlers:        ck.ctrlers,
+		config:         cfg,
+		makeEndFactory: ck.makeEndFactory,
+		ends:           make(map[string]*labrpc.ClientEnd),
+		ClientID:       nrand(),
+		nextRPCID:      1,
+		leaderHint:     leaderHint,
+	}
+	return clone
+}
+
+func (ck *Clerk) Close() {
+	ck.endMu.Lock()
+	defer ck.endMu.Unlock()
+	for name, end := range ck.ends {
+		_ = end.Close()
+		delete(ck.ends, name)
+	}
 }
 
 func (ck *Clerk) allocRPCID() int64 {
@@ -120,7 +150,46 @@ func (ck *Clerk) allocRPCID() int64 {
 }
 
 func (ck *Clerk) refreshConfig() {
-	ck.config = ck.sm.Query(-1)
+	cfg := ck.sm.Query(-1)
+	ck.mu.Lock()
+	ck.config = cfg
+	ck.mu.Unlock()
+}
+
+func (ck *Clerk) currentConfig() shardctrler.Config {
+	ck.mu.RLock()
+	defer ck.mu.RUnlock()
+	return ck.config
+}
+
+func (ck *Clerk) snapshotLeaderHint() map[int]int {
+	ck.mu.RLock()
+	defer ck.mu.RUnlock()
+	out := make(map[int]int, len(ck.leaderHint))
+	for gid, hint := range ck.leaderHint {
+		out[gid] = hint
+	}
+	return out
+}
+
+func (ck *Clerk) makeEnd(servername string) *labrpc.ClientEnd {
+	ck.endMu.Lock()
+	if end, ok := ck.ends[servername]; ok {
+		ck.endMu.Unlock()
+		return end
+	}
+	ck.endMu.Unlock()
+
+	end := ck.makeEndFactory(servername)
+
+	ck.endMu.Lock()
+	defer ck.endMu.Unlock()
+	if existing, ok := ck.ends[servername]; ok {
+		_ = end.Close()
+		return existing
+	}
+	ck.ends[servername] = end
+	return end
 }
 
 func (ck *Clerk) serverOrder(gid int, n int) []int {
@@ -128,6 +197,8 @@ func (ck *Clerk) serverOrder(gid int, n int) []int {
 	if n <= 0 {
 		return order
 	}
+	ck.mu.RLock()
+	defer ck.mu.RUnlock()
 	if hint, ok := ck.leaderHint[gid]; ok && hint >= 0 && hint < n {
 		order = append(order, hint)
 		for i := 0; i < n; i++ {
@@ -145,11 +216,15 @@ func (ck *Clerk) serverOrder(gid int, n int) []int {
 
 func (ck *Clerk) rememberLeader(gid, serverIdx int) {
 	if serverIdx >= 0 {
+		ck.mu.Lock()
 		ck.leaderHint[gid] = serverIdx
+		ck.mu.Unlock()
 	}
 }
 
 func (ck *Clerk) forgetLeader(gid, serverIdx int) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
 	if hint, ok := ck.leaderHint[gid]; ok && hint == serverIdx {
 		delete(ck.leaderHint, gid)
 	}
@@ -207,9 +282,10 @@ func (ck *Clerk) GetWithErr(key string) (string, Err) {
 	args.RPCID = ck.allocRPCID()
 
 	for {
+		cfg := ck.currentConfig()
 		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
+		gid := cfg.Shards[shard]
+		if servers, ok := cfg.Groups[gid]; ok {
 			// try each server for the shard.
 			for _, si := range ck.serverOrder(gid, len(servers)) {
 				srv := ck.makeEnd(servers[si])
@@ -247,9 +323,10 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.RPCID = ck.allocRPCID()
 
 	for {
+		cfg := ck.currentConfig()
 		shard := key2shard(key)
-		gid := ck.config.Shards[shard]
-		if servers, ok := ck.config.Groups[gid]; ok {
+		gid := cfg.Shards[shard]
+		if servers, ok := cfg.Groups[gid]; ok {
 			for _, si := range ck.serverOrder(gid, len(servers)) {
 				srv := ck.makeEnd(servers[si])
 				var reply PutAppendReply
@@ -288,7 +365,7 @@ func (ck *Clerk) Range(start, end string, limit int) []KeyValue {
 	}
 
 	for {
-		cfg := ck.config
+		cfg := ck.currentConfig()
 		if len(targetShards) == 1 {
 			kvs, ok, needRefresh := ck.rangeOnShard(cfg, targetShards[0], start, end, limit, ck.allocRPCID())
 			if ok {

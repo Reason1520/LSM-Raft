@@ -1,7 +1,10 @@
 pkg/
+.gocache/
+*.test.exe
 api.key
 .api.key.trimmed
 *-handin.tar.gz
 事务处理器实现.md
 README_DETAILED.md
 INTERVIEW_QUESTIONS.md
+CROSS_SHARD_TXN_2PC_LOCAL.md

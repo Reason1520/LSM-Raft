@@ -2,6 +2,7 @@ package shardkv
 
 import (
 	"context"
+	"sync"
 
 	"6.5840/shardkvpb"
 )
@@ -9,11 +10,24 @@ import (
 // GRPCServer exposes shardkv APIs over gRPC.
 type GRPCServer struct {
 	shardkvpb.UnimplementedShardKVServer
-	ck *Clerk
+	pool sync.Pool
 }
 
 func NewGRPCServer(ck *Clerk) *GRPCServer {
-	return &GRPCServer{ck: ck}
+	s := &GRPCServer{}
+	s.pool.New = func() interface{} {
+		return ck.Clone()
+	}
+	s.pool.Put(ck)
+	return s
+}
+
+func (s *GRPCServer) getClerk() *Clerk {
+	return s.pool.Get().(*Clerk)
+}
+
+func (s *GRPCServer) putClerk(ck *Clerk) {
+	s.pool.Put(ck)
 }
 
 func toIsolation(level shardkvpb.IsolationLevel) IsolationLevel {
@@ -39,22 +53,30 @@ func errString(e Err) string {
 }
 
 func (s *GRPCServer) Get(ctx context.Context, req *shardkvpb.GetRequest) (*shardkvpb.GetResponse, error) {
-	val, err := s.ck.GetWithErr(req.Key)
+	ck := s.getClerk()
+	defer s.putClerk(ck)
+	val, err := ck.GetWithErr(req.Key)
 	return &shardkvpb.GetResponse{Err: errString(err), Value: val}, nil
 }
 
 func (s *GRPCServer) Put(ctx context.Context, req *shardkvpb.PutRequest) (*shardkvpb.PutResponse, error) {
-	s.ck.Put(req.Key, req.Value)
+	ck := s.getClerk()
+	defer s.putClerk(ck)
+	ck.Put(req.Key, req.Value)
 	return &shardkvpb.PutResponse{Err: string(OK)}, nil
 }
 
 func (s *GRPCServer) Append(ctx context.Context, req *shardkvpb.AppendRequest) (*shardkvpb.AppendResponse, error) {
-	s.ck.Append(req.Key, req.Value)
+	ck := s.getClerk()
+	defer s.putClerk(ck)
+	ck.Append(req.Key, req.Value)
 	return &shardkvpb.AppendResponse{Err: string(OK)}, nil
 }
 
 func (s *GRPCServer) Range(ctx context.Context, req *shardkvpb.RangeRequest) (*shardkvpb.RangeResponse, error) {
-	kvs := s.ck.Range(req.Start, req.End, int(req.Limit))
+	ck := s.getClerk()
+	defer s.putClerk(ck)
+	kvs := ck.Range(req.Start, req.End, int(req.Limit))
 	out := make([]*shardkvpb.KeyValue, 0, len(kvs))
 	for _, kv := range kvs {
 		out = append(out, &shardkvpb.KeyValue{Key: kv.Key, Value: kv.Value})
@@ -67,8 +89,10 @@ func (s *GRPCServer) TxnBegin(ctx context.Context, req *shardkvpb.TxnBeginReques
 		return &shardkvpb.TxnBeginResponse{Err: string(ErrWrongGroup)}, nil
 	}
 
+	ck := s.getClerk()
+	defer s.putClerk(ck)
 	shard := key2shard(req.KeyHint)
-	txnID, snapshot := s.ck.txnBeginOnShard(shard, toIsolation(req.Isolation))
+	txnID, snapshot := ck.txnBeginOnShard(shard, toIsolation(req.Isolation))
 	return &shardkvpb.TxnBeginResponse{
 		Err:      string(OK),
 		TxnId:    txnID,
@@ -77,8 +101,10 @@ func (s *GRPCServer) TxnBegin(ctx context.Context, req *shardkvpb.TxnBeginReques
 }
 
 func (s *GRPCServer) TxnGet(ctx context.Context, req *shardkvpb.TxnGetRequest) (*shardkvpb.TxnGetResponse, error) {
+	ck := s.getClerk()
+	defer s.putClerk(ck)
 	expectShard := key2shard(req.Key)
-	val, ver, err := s.ck.txnGetOnShard(expectShard, req.Key, req.Snapshot, req.TxnId)
+	val, ver, err := ck.txnGetOnShard(expectShard, req.Key, req.Snapshot, req.TxnId)
 	return &shardkvpb.TxnGetResponse{
 		Err:     errString(err),
 		Value:   val,
@@ -94,7 +120,9 @@ func (s *GRPCServer) TxnRange(ctx context.Context, req *shardkvpb.TxnRangeReques
 	if req.End != "" && key2shard(req.End) != shard {
 		return &shardkvpb.TxnRangeResponse{Err: string(ErrWrongGroup)}, nil
 	}
-	kvs, err := s.ck.txnRangeOnShard(shard, req.Start, req.End, int(req.Limit), req.Snapshot, req.TxnId)
+	ck := s.getClerk()
+	defer s.putClerk(ck)
+	kvs, err := ck.txnRangeOnShard(shard, req.Start, req.End, int(req.Limit), req.Snapshot, req.TxnId)
 	out := make([]*shardkvpb.TxnRangeKV, 0, len(kvs))
 	for _, kv := range kvs {
 		out = append(out, &shardkvpb.TxnRangeKV{
@@ -106,7 +134,16 @@ func (s *GRPCServer) TxnRange(ctx context.Context, req *shardkvpb.TxnRangeReques
 	return &shardkvpb.TxnRangeResponse{Err: errString(err), Kvs: out}, nil
 }
 
+func (s *GRPCServer) TxnAbort(ctx context.Context, req *shardkvpb.TxnGetRequest) (*shardkvpb.TxnCommitResponse, error) {
+	ck := s.getClerk()
+	defer s.putClerk(ck)
+	err := ck.txnAbortEverywhere(req.TxnId)
+	return &shardkvpb.TxnCommitResponse{Err: errString(err)}, nil
+}
+
 func (s *GRPCServer) TxnCommit(ctx context.Context, req *shardkvpb.TxnCommitRequest) (*shardkvpb.TxnCommitResponse, error) {
+	ck := s.getClerk()
+	defer s.putClerk(ck)
 	writes := make([]TxnWrite, 0, len(req.Writes))
 	for _, w := range req.Writes {
 		writes = append(writes, TxnWrite{Key: w.Key, Value: w.Value, Delete: w.Delete})
@@ -134,16 +171,17 @@ func (s *GRPCServer) TxnCommit(ctx context.Context, req *shardkvpb.TxnCommitRequ
 		}
 	}
 	if shard == -1 {
-		return &shardkvpb.TxnCommitResponse{Err: string(OK)}, nil
+		err := ck.txnAbortEverywhere(req.TxnId)
+		return &shardkvpb.TxnCommitResponse{Err: errString(err)}, nil
 	}
 	args := TxnCommitArgs{
 		TxnID:     req.TxnId,
-		ClientID:  s.ck.ClientID,
-		RPCID:     s.ck.allocRPCID(),
+		ClientID:  ck.ClientID,
+		RPCID:     ck.allocRPCID(),
 		Isolation: toIsolation(req.Isolation),
 		Writes:    writes,
 		Reads:     reads,
 	}
-	err := s.ck.txnCommitOnShard(shard, &args)
+	err := ck.txnCommitOnShard(shard, &args)
 	return &shardkvpb.TxnCommitResponse{Err: errString(err)}, nil
 }

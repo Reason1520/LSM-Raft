@@ -23,6 +23,7 @@ const (
 	GCInterval           = 100 * time.Millisecond
 	TxnGCInterval        = 500 * time.Millisecond
 	TxnTTL               = 30 * time.Second
+	TxnRecoveryInterval  = 200 * time.Millisecond
 )
 
 const (
@@ -48,15 +49,23 @@ type Op struct {
 	Config     shardctrler.Config
 	ShardData  map[string]string
 	LastOpMap  map[int64]OpResult
+	GID        int
 	ShardID    int
 	ConfigNum  int
+	CoordGID   int
+	Snapshot   uint64
 }
 
 type OpResult struct {
-	Err   Err
-	Value string
-	KVs   []KeyValue
-	RPCID int64
+	Err       Err
+	Value     string
+	KVs       []KeyValue
+	RPCID     int64
+	TxnID     uint64
+	Snapshot  uint64
+	ConfigNum int
+	GID       int
+	ShardID   int
 }
 
 type ShardKV struct {
@@ -85,12 +94,16 @@ type ShardKV struct {
 
 	waitCh map[int]chan OpResult
 
-	nextTxnID   uint64
-	lastApplied int
+	nextTxnID         uint64
+	nextInternalRPCID int64
+	lastApplied       int
 
 	activeTxn     map[uint64]uint64
 	activeTxnLast map[uint64]time.Time
 	gcWatermark   uint64
+	coordTxns     map[uint64]CoordTxnRecord
+	branchTxns    map[uint64]BranchTxnRecord
+	preparedKeys  map[string]uint64
 
 	snapshotMu     sync.Mutex
 	pendingSnap    *snapshotTask
@@ -101,13 +114,16 @@ type ShardKV struct {
 }
 
 type snapshotTask struct {
-	index      int
-	engines    map[int]*lsm.LSMEngine
-	shadowDB   map[int]map[int]map[string]string
-	shardState map[int]int
-	lastOps    map[int64]OpResult
-	config     shardctrler.Config
-	lastConfig shardctrler.Config
+	index        int
+	engines      map[int]*lsm.LSMEngine
+	shadowDB     map[int]map[int]map[string]string
+	shardState   map[int]int
+	lastOps      map[int64]OpResult
+	config       shardctrler.Config
+	lastConfig   shardctrler.Config
+	coordTxns    map[uint64]CoordTxnRecord
+	branchTxns   map[uint64]BranchTxnRecord
+	preparedKeys map[string]uint64
 }
 
 // Check strictly if I can serve this key
@@ -350,6 +366,240 @@ func (kv *ShardKV) TxnBegin(args *TxnBeginArgs, reply *TxnBeginReply) {
 	}
 }
 
+func (kv *ShardKV) TxnCoordBegin(args *TxnCoordBeginArgs, reply *TxnCoordBeginReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	if args.AnchorKey == "" {
+		reply.Err = ErrWrongGroup
+		return
+	}
+
+	txnID := atomic.AddUint64(&kv.nextTxnID, 1)
+	op := Op{
+		Type:      TXNCOORDBEGIN,
+		TxnID:     txnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		Isolation: args.Isolation,
+		ConfigNum: args.ConfigNum,
+		ShardID:   key2shard(args.AnchorKey),
+		CoordGID:  kv.gid,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+	reply.TxnID = res.TxnID
+	reply.CoordGID = res.GID
+	reply.ConfigNum = res.ConfigNum
+}
+
+func (kv *ShardKV) TxnCoordEnlist(args *TxnCoordEnlistArgs, reply *TxnCoordEnlistReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNCOORDENLIST,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		ConfigNum: args.ConfigNum,
+		GID:       args.GID,
+		ShardID:   args.ShardID,
+		Snapshot:  args.Snapshot,
+		CoordGID:  kv.gid,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnBranchBegin(args *TxnBranchBeginArgs, reply *TxnBranchBeginReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNBRANCHBEGIN,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		Isolation: args.Isolation,
+		ConfigNum: args.ConfigNum,
+		CoordGID:  args.CoordGID,
+		ShardID:   args.ShardID,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+	reply.Snapshot = res.Snapshot
+	reply.GID = res.GID
+	reply.ShardID = res.ShardID
+}
+
+func (kv *ShardKV) TxnCoordPrepare(args *TxnCoordPrepareArgs, reply *TxnCoordPrepareReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNCOORDPREPARE,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		ConfigNum: args.ConfigNum,
+		GID:       args.GID,
+		ShardID:   args.ShardID,
+		Snapshot:  args.Snapshot,
+		Reads:     args.Reads,
+		Writes:    args.Writes,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnCoordAbort(args *TxnCoordAbortArgs, reply *TxnCoordAbortReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNCOORDABORT,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		ConfigNum: args.ConfigNum,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnCoordCommit(args *TxnCoordCommitArgs, reply *TxnCoordCommitReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNCOORDCOMMIT,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		ConfigNum: args.ConfigNum,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnCoordFinish(args *TxnCoordFinishArgs, reply *TxnCoordFinishReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNCOORDFINISH,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		ConfigNum: args.ConfigNum,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnCoordStatus(args *TxnCoordStatusArgs, reply *TxnCoordStatusReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	rec, ok := kv.coordTxns[args.TxnID]
+	if !ok {
+		reply.Err = ErrNoKey
+		return
+	}
+	if args.ConfigNum != 0 && rec.ConfigNum != args.ConfigNum {
+		reply.Err = ErrConfigNotReady
+		return
+	}
+	reply.Err = OK
+	reply.State = rec.State
+}
+
+func (kv *ShardKV) TxnBranchPrepare(args *TxnBranchPrepareArgs, reply *TxnBranchPrepareReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNBRANCHPREPARE,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		ConfigNum: args.ConfigNum,
+		CoordGID:  args.CoordGID,
+		ShardID:   args.ShardID,
+		Snapshot:  args.Snapshot,
+		Isolation: args.Isolation,
+		Reads:     args.Reads,
+		Writes:    args.Writes,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnBranchAbort(args *TxnBranchAbortArgs, reply *TxnBranchAbortReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNBRANCHABORT,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		ConfigNum: args.ConfigNum,
+		ShardID:   args.ShardID,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnBranchCommit(args *TxnBranchCommitArgs, reply *TxnBranchCommitReply) {
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+
+	op := Op{
+		Type:      TXNBRANCHCOMMIT,
+		TxnID:     args.TxnID,
+		ClientID:  args.ClientID,
+		RPCID:     args.RPCID,
+		ConfigNum: args.ConfigNum,
+		ShardID:   args.ShardID,
+	}
+
+	res := kv.startOp(op)
+	reply.Err = res.Err
+}
+
 func (kv *ShardKV) TxnGet(args *TxnGetArgs, reply *TxnGetReply) {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.Err = ErrWrongLeader
@@ -433,6 +683,18 @@ func (kv *ShardKV) TxnCommit(args *TxnCommitArgs, reply *TxnCommitReply) {
 
 	res := kv.startOp(op)
 	reply.Err = res.Err
+}
+
+func (kv *ShardKV) TxnAbort(args *TxnAbortArgs, reply *TxnAbortReply) {
+	kv.mu.Lock()
+	if rec, ok := kv.branchTxns[args.TxnID]; ok {
+		kv.releasePreparedKeysLocked(rec.Writes, args.TxnID)
+	}
+	kv.unregisterTxnLocked(args.TxnID)
+	delete(kv.coordTxns, args.TxnID)
+	delete(kv.branchTxns, args.TxnID)
+	kv.mu.Unlock()
+	reply.Err = OK
 }
 
 func (kv *ShardKV) TxnRange(args *TxnRangeArgs, reply *TxnRangeReply) {
@@ -546,6 +808,10 @@ func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 		reply.Err = ErrNotReady
 		return
 	}
+	if kv.hasPreparedTxnOnShardLocked(args.ShardIndex) {
+		reply.Err = ErrNotReady
+		return
+	}
 
 	if shards, ok := kv.shadowDB[args.ConfigNum]; ok {
 		if shardData, ok := shards[args.ShardIndex]; ok {
@@ -576,6 +842,11 @@ func (kv *ShardKV) DeleteShard(args *PullDataArgs, reply *PullDataReply) {
 
 	kv.mu.Lock()
 	if args.ConfigNum >= kv.config.Num {
+		reply.Err = ErrNotReady
+		kv.mu.Unlock()
+		return
+	}
+	if kv.hasPreparedTxnOnShardLocked(args.ShardIndex) {
 		reply.Err = ErrNotReady
 		kv.mu.Unlock()
 		return
@@ -616,6 +887,26 @@ func (kv *ShardKV) applier() {
 				res = kv.applyRange(op, index)
 			case TXNBEGIN:
 				res = OpResult{Err: OK, RPCID: op.RPCID}
+			case TXNCOORDBEGIN:
+				res = kv.applyTxnCoordBegin(op)
+			case TXNCOORDENLIST:
+				res = kv.applyTxnCoordEnlist(op)
+			case TXNBRANCHBEGIN:
+				res = kv.applyTxnBranchBegin(op, index)
+			case TXNCOORDPREPARE:
+				res = kv.applyTxnCoordPrepare(op)
+			case TXNCOORDABORT:
+				res = kv.applyTxnCoordAbort(op)
+			case TXNCOORDCOMMIT:
+				res = kv.applyTxnCoordCommit(op)
+			case TXNCOORDFINISH:
+				res = kv.applyTxnCoordFinish(op)
+			case TXNBRANCHPREPARE:
+				res = kv.applyTxnBranchPrepare(op)
+			case TXNBRANCHABORT:
+				res = kv.applyTxnBranchAbort(op)
+			case TXNBRANCHCOMMIT:
+				res = kv.applyTxnBranchCommit(op, index)
 			case RECONFIG:
 				res = kv.applyReconfig(op)
 			case INSERTSHARD:
@@ -898,6 +1189,333 @@ func (kv *ShardKV) applyTxnCommit(op Op, index int) OpResult {
 	return res
 }
 
+func (kv *ShardKV) applyTxnCoordBegin(op Op) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if op.ConfigNum != kv.config.Num {
+		return OpResult{Err: ErrConfigNotReady, RPCID: op.RPCID}
+	}
+	if !kv.canServe(op.ShardID) {
+		return OpResult{Err: ErrWrongGroup, RPCID: op.RPCID}
+	}
+	if _, ok := kv.coordTxns[op.TxnID]; !ok {
+		kv.coordTxns[op.TxnID] = CoordTxnRecord{
+			TxnID:        op.TxnID,
+			ConfigNum:    op.ConfigNum,
+			Isolation:    op.Isolation,
+			CoordGID:     kv.gid,
+			AnchorShard:  op.ShardID,
+			State:        CoordTxnBegun,
+			Participants: make(map[int]CoordTxnParticipant),
+			Branches:     make(map[int]CoordTxnBranchRecord),
+		}
+	}
+	res := OpResult{
+		Err:       OK,
+		RPCID:     op.RPCID,
+		TxnID:     op.TxnID,
+		ConfigNum: op.ConfigNum,
+		GID:       kv.gid,
+	}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnCoordEnlist(op Op) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if op.ConfigNum != kv.config.Num {
+		return OpResult{Err: ErrConfigNotReady, RPCID: op.RPCID}
+	}
+	rec, ok := kv.coordTxns[op.TxnID]
+	if !ok {
+		return OpResult{Err: ErrNotReady, RPCID: op.RPCID}
+	}
+	if rec.Participants == nil {
+		rec.Participants = make(map[int]CoordTxnParticipant)
+	}
+	rec.Participants[op.GID] = CoordTxnParticipant{
+		GID:      op.GID,
+		ShardID:  op.ShardID,
+		Snapshot: op.Snapshot,
+	}
+	kv.coordTxns[op.TxnID] = rec
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnBranchBegin(op Op, index int) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if op.ConfigNum != kv.config.Num {
+		return OpResult{Err: ErrConfigNotReady, RPCID: op.RPCID}
+	}
+	if !kv.canServe(op.ShardID) {
+		return OpResult{Err: ErrWrongGroup, RPCID: op.RPCID}
+	}
+	if rec, ok := kv.branchTxns[op.TxnID]; ok {
+		res := OpResult{
+			Err:       OK,
+			RPCID:     op.RPCID,
+			TxnID:     op.TxnID,
+			Snapshot:  rec.Snapshot,
+			ConfigNum: rec.ConfigNum,
+			GID:       rec.GID,
+			ShardID:   rec.ShardID,
+		}
+		kv.lastOps[op.ClientID] = res
+		return res
+	}
+
+	snapshot := uint64(index)
+	kv.branchTxns[op.TxnID] = BranchTxnRecord{
+		TxnID:     op.TxnID,
+		ConfigNum: op.ConfigNum,
+		CoordGID:  op.CoordGID,
+		GID:       kv.gid,
+		ShardID:   op.ShardID,
+		Snapshot:  snapshot,
+		Isolation: op.Isolation,
+		State:     BranchTxnBegun,
+	}
+	kv.registerTxnLocked(op.TxnID, snapshot)
+
+	res := OpResult{
+		Err:       OK,
+		RPCID:     op.RPCID,
+		TxnID:     op.TxnID,
+		Snapshot:  snapshot,
+		ConfigNum: op.ConfigNum,
+		GID:       kv.gid,
+		ShardID:   op.ShardID,
+	}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnCoordPrepare(op Op) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if op.ConfigNum != kv.config.Num {
+		return OpResult{Err: ErrConfigNotReady, RPCID: op.RPCID}
+	}
+	rec, ok := kv.coordTxns[op.TxnID]
+	if !ok {
+		return OpResult{Err: ErrNotReady, RPCID: op.RPCID}
+	}
+	if rec.Branches == nil {
+		rec.Branches = make(map[int]CoordTxnBranchRecord)
+	}
+	rec.State = CoordTxnPreparing
+	rec.Branches[op.GID] = CoordTxnBranchRecord{
+		GID:      op.GID,
+		ShardID:  op.ShardID,
+		Snapshot: op.Snapshot,
+		Reads:    append([]TxnRead(nil), op.Reads...),
+		Writes:   append([]TxnWrite(nil), op.Writes...),
+		Prepared: false,
+	}
+	kv.coordTxns[op.TxnID] = rec
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnCoordAbort(op Op) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if rec, ok := kv.coordTxns[op.TxnID]; ok {
+		rec.State = CoordTxnAborted
+		kv.coordTxns[op.TxnID] = rec
+		delete(kv.coordTxns, op.TxnID)
+	}
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnCoordCommit(op Op) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if op.ConfigNum != kv.config.Num {
+		return OpResult{Err: ErrConfigNotReady, RPCID: op.RPCID}
+	}
+	rec, ok := kv.coordTxns[op.TxnID]
+	if !ok {
+		return OpResult{Err: ErrNotReady, RPCID: op.RPCID}
+	}
+	rec.State = CoordTxnCommitted
+	kv.coordTxns[op.TxnID] = rec
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnCoordFinish(op Op) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	delete(kv.coordTxns, op.TxnID)
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnBranchPrepare(op Op) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if op.ConfigNum != kv.config.Num {
+		return OpResult{Err: ErrConfigNotReady, RPCID: op.RPCID}
+	}
+	if !kv.canServe(op.ShardID) {
+		return OpResult{Err: ErrWrongGroup, RPCID: op.RPCID}
+	}
+	rec, ok := kv.branchTxns[op.TxnID]
+	if !ok {
+		return OpResult{Err: ErrNotReady, RPCID: op.RPCID}
+	}
+	if rec.Snapshot != op.Snapshot {
+		return OpResult{Err: ErrConflict, RPCID: op.RPCID}
+	}
+	if rec.Prepared {
+		res := OpResult{Err: OK, RPCID: op.RPCID}
+		kv.lastOps[op.ClientID] = res
+		return res
+	}
+	engine := kv.ensureShardEngine(op.ShardID)
+	if op.Isolation == RepeatableRead || op.Isolation == Serializable {
+		for _, r := range op.Reads {
+			_, tid := engine.Get(r.Key, 0)
+			if tid != r.Version {
+				res := OpResult{Err: ErrConflict, RPCID: op.RPCID}
+				kv.lastOps[op.ClientID] = res
+				return res
+			}
+		}
+	}
+	for _, w := range op.Writes {
+		if owner, ok := kv.preparedKeys[w.Key]; ok && owner != op.TxnID {
+			res := OpResult{Err: ErrConflict, RPCID: op.RPCID}
+			kv.lastOps[op.ClientID] = res
+			return res
+		}
+	}
+	for _, w := range op.Writes {
+		kv.preparedKeys[w.Key] = op.TxnID
+	}
+	rec.State = BranchTxnPrepared
+	rec.Prepared = true
+	rec.Reads = append([]TxnRead(nil), op.Reads...)
+	rec.Writes = append([]TxnWrite(nil), op.Writes...)
+	kv.branchTxns[op.TxnID] = rec
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnBranchCommit(op Op, index int) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if op.ConfigNum != kv.config.Num {
+		return OpResult{Err: ErrConfigNotReady, RPCID: op.RPCID}
+	}
+	if !kv.canServe(op.ShardID) {
+		return OpResult{Err: ErrWrongGroup, RPCID: op.RPCID}
+	}
+	rec, ok := kv.branchTxns[op.TxnID]
+	if !ok {
+		return OpResult{Err: ErrNotReady, RPCID: op.RPCID}
+	}
+	if !rec.Prepared {
+		return OpResult{Err: ErrNotReady, RPCID: op.RPCID}
+	}
+
+	engine := kv.ensureShardEngine(op.ShardID)
+	trancID := uint64(index)
+	if len(rec.Writes) > 0 {
+		putBatch := make([]lsm.KV, 0, len(rec.Writes))
+		deleteBatch := make([]string, 0, len(rec.Writes))
+		for _, w := range rec.Writes {
+			if w.Delete {
+				deleteBatch = append(deleteBatch, w.Key)
+			} else {
+				putBatch = append(putBatch, lsm.KV{Key: w.Key, Value: encodeValue(w.Value)})
+			}
+		}
+		if len(putBatch) > 0 {
+			engine.PutBatch(putBatch, trancID)
+		}
+		if len(deleteBatch) > 0 {
+			engine.RemoveBatch(deleteBatch, trancID)
+		}
+	}
+	kv.releasePreparedKeysLocked(rec.Writes, op.TxnID)
+	delete(kv.branchTxns, op.TxnID)
+	kv.unregisterTxnLocked(op.TxnID)
+
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) applyTxnBranchAbort(op Op) OpResult {
+	if lastRes, ok := kv.lastOps[op.ClientID]; ok && op.RPCID <= lastRes.RPCID {
+		return lastRes
+	}
+	if rec, ok := kv.branchTxns[op.TxnID]; ok {
+		kv.releasePreparedKeysLocked(rec.Writes, op.TxnID)
+		delete(kv.branchTxns, op.TxnID)
+	}
+	kv.unregisterTxnLocked(op.TxnID)
+	res := OpResult{Err: OK, RPCID: op.RPCID}
+	kv.lastOps[op.ClientID] = res
+	return res
+}
+
+func (kv *ShardKV) releasePreparedKeysLocked(writes []TxnWrite, txnID uint64) {
+	for _, w := range writes {
+		if owner, ok := kv.preparedKeys[w.Key]; ok && owner == txnID {
+			delete(kv.preparedKeys, w.Key)
+		}
+	}
+}
+
+func (kv *ShardKV) hasPreparedTxnLocked() bool {
+	for _, rec := range kv.branchTxns {
+		if rec.Prepared {
+			return true
+		}
+	}
+	return false
+}
+
+func (kv *ShardKV) hasBlockingCoordTxnLocked() bool {
+	for _, rec := range kv.coordTxns {
+		if rec.State == CoordTxnBegun || rec.State == CoordTxnPreparing {
+			return true
+		}
+	}
+	return false
+}
+
+func (kv *ShardKV) hasPreparedTxnOnShardLocked(shard int) bool {
+	for _, rec := range kv.branchTxns {
+		if rec.Prepared && rec.ShardID == shard {
+			return true
+		}
+	}
+	return false
+}
+
 // --- MVCC GC helpers (must hold lock) ---
 
 func (kv *ShardKV) registerTxnLocked(txnID uint64, snapshot uint64) {
@@ -969,6 +1587,81 @@ func (kv *ShardKV) monitorTxnGC() {
 			}
 		}
 		kv.mu.Unlock()
+	}
+}
+
+func (kv *ShardKV) internalClientID() int64 {
+	return -int64(kv.gid*1000 + kv.me + 1)
+}
+
+func (kv *ShardKV) allocInternalRPCID() int64 {
+	return atomic.AddInt64(&kv.nextInternalRPCID, 1)
+}
+
+func (kv *ShardKV) coordinatorStatus(rec BranchTxnRecord) (CoordTxnState, Err) {
+	cfg := kv.mck.Query(rec.ConfigNum)
+	servers, ok := cfg.Groups[rec.CoordGID]
+	if !ok || rec.CoordGID == 0 || len(servers) == 0 {
+		return 0, ErrWrongGroup
+	}
+	args := TxnCoordStatusArgs{
+		TxnID:     rec.TxnID,
+		ConfigNum: rec.ConfigNum,
+	}
+	for _, server := range servers {
+		srv := kv.make_end(server)
+		var reply TxnCoordStatusReply
+		ok := srv.Call("ShardKV.TxnCoordStatus", &args, &reply)
+		if ok && (reply.Err == OK || reply.Err == "") {
+			return reply.State, OK
+		}
+	}
+	return 0, ErrTimeout
+}
+
+func (kv *ShardKV) monitorTxnRecovery() {
+	for !kv.killed() {
+		time.Sleep(TxnRecoveryInterval)
+		if _, isLeader := kv.rf.GetState(); !isLeader {
+			continue
+		}
+
+		kv.mu.Lock()
+		pending := make([]BranchTxnRecord, 0)
+		for _, rec := range kv.branchTxns {
+			if rec.Prepared {
+				pending = append(pending, rec)
+			}
+		}
+		kv.mu.Unlock()
+
+		for _, rec := range pending {
+			state, err := kv.coordinatorStatus(rec)
+			if err != OK {
+				continue
+			}
+
+			switch state {
+			case CoordTxnCommitted:
+				kv.startOp(Op{
+					Type:      TXNBRANCHCOMMIT,
+					TxnID:     rec.TxnID,
+					ClientID:  kv.internalClientID(),
+					RPCID:     kv.allocInternalRPCID(),
+					ConfigNum: rec.ConfigNum,
+					ShardID:   rec.ShardID,
+				})
+			case CoordTxnAborted:
+				kv.startOp(Op{
+					Type:      TXNBRANCHABORT,
+					TxnID:     rec.TxnID,
+					ClientID:  kv.internalClientID(),
+					RPCID:     kv.allocInternalRPCID(),
+					ConfigNum: rec.ConfigNum,
+					ShardID:   rec.ShardID,
+				})
+			}
+		}
 	}
 }
 
@@ -1085,6 +1778,67 @@ func cloneLastOps(src map[int64]OpResult) map[int64]OpResult {
 	return dst
 }
 
+func cloneTxnReads(src []TxnRead) []TxnRead {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]TxnRead, len(src))
+	copy(dst, src)
+	return dst
+}
+
+func cloneTxnWrites(src []TxnWrite) []TxnWrite {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]TxnWrite, len(src))
+	copy(dst, src)
+	return dst
+}
+
+func cloneCoordTxns(src map[uint64]CoordTxnRecord) map[uint64]CoordTxnRecord {
+	dst := make(map[uint64]CoordTxnRecord, len(src))
+	for txnID, rec := range src {
+		recCopy := rec
+		if rec.Participants != nil {
+			recCopy.Participants = make(map[int]CoordTxnParticipant, len(rec.Participants))
+			for gid, p := range rec.Participants {
+				recCopy.Participants[gid] = p
+			}
+		}
+		if rec.Branches != nil {
+			recCopy.Branches = make(map[int]CoordTxnBranchRecord, len(rec.Branches))
+			for gid, b := range rec.Branches {
+				bCopy := b
+				bCopy.Reads = cloneTxnReads(b.Reads)
+				bCopy.Writes = cloneTxnWrites(b.Writes)
+				recCopy.Branches[gid] = bCopy
+			}
+		}
+		dst[txnID] = recCopy
+	}
+	return dst
+}
+
+func cloneBranchTxns(src map[uint64]BranchTxnRecord) map[uint64]BranchTxnRecord {
+	dst := make(map[uint64]BranchTxnRecord, len(src))
+	for txnID, rec := range src {
+		recCopy := rec
+		recCopy.Reads = cloneTxnReads(rec.Reads)
+		recCopy.Writes = cloneTxnWrites(rec.Writes)
+		dst[txnID] = recCopy
+	}
+	return dst
+}
+
+func clonePreparedKeys(src map[string]uint64) map[string]uint64 {
+	dst := make(map[string]uint64, len(src))
+	for key, txnID := range src {
+		dst[key] = txnID
+	}
+	return dst
+}
+
 func (kv *ShardKV) captureSnapshotTaskLocked(index int) *snapshotTask {
 	engines := make(map[int]*lsm.LSMEngine, len(kv.kvDB))
 	for shard, engine := range kv.kvDB {
@@ -1094,13 +1848,16 @@ func (kv *ShardKV) captureSnapshotTaskLocked(index int) *snapshotTask {
 	}
 	kv.snapshotRefsWG.Add(1)
 	return &snapshotTask{
-		index:      index,
-		engines:    engines,
-		shadowDB:   cloneShadowDB(kv.shadowDB),
-		shardState: cloneShardStatus(kv.shardStatus),
-		lastOps:    cloneLastOps(kv.lastOps),
-		config:     kv.config,
-		lastConfig: kv.lastConfig,
+		index:        index,
+		engines:      engines,
+		shadowDB:     cloneShadowDB(kv.shadowDB),
+		shardState:   cloneShardStatus(kv.shardStatus),
+		lastOps:      cloneLastOps(kv.lastOps),
+		config:       kv.config,
+		lastConfig:   kv.lastConfig,
+		coordTxns:    cloneCoordTxns(kv.coordTxns),
+		branchTxns:   cloneBranchTxns(kv.branchTxns),
+		preparedKeys: clonePreparedKeys(kv.preparedKeys),
 	}
 }
 
@@ -1162,6 +1919,9 @@ func (kv *ShardKV) monitorConfig() {
 					canNext = false
 					break
 				}
+			}
+			if canNext && (kv.hasBlockingCoordTxnLocked() || len(kv.branchTxns) > 0 || kv.hasPreparedTxnLocked()) {
+				canNext = false
 			}
 			curNum := kv.config.Num
 			kv.mu.Unlock()
@@ -1272,6 +2032,9 @@ func (kv *ShardKV) runSnapshotTask(task *snapshotTask) {
 	e.Encode(task.lastOps)
 	e.Encode(task.config)
 	e.Encode(task.lastConfig)
+	e.Encode(task.coordTxns)
+	e.Encode(task.branchTxns)
+	e.Encode(task.preparedKeys)
 
 	kv.rf.Snapshot(task.index, w.Bytes())
 }
@@ -1306,6 +2069,9 @@ func (kv *ShardKV) snapshotWorker() {
 
 func (kv *ShardKV) readSnapshot(data []byte) {
 	if data == nil || len(data) < 1 {
+		kv.coordTxns = make(map[uint64]CoordTxnRecord)
+		kv.branchTxns = make(map[uint64]BranchTxnRecord)
+		kv.preparedKeys = make(map[string]uint64)
 		return
 	}
 	r := bytes.NewBuffer(data)
@@ -1317,13 +2083,19 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 	var lastOps map[int64]OpResult
 	var config shardctrler.Config
 	var lastConfig shardctrler.Config
+	var coordTxns map[uint64]CoordTxnRecord
+	var branchTxns map[uint64]BranchTxnRecord
+	var preparedKeys map[string]uint64
 
 	if d.Decode(&kvDB) != nil ||
 		d.Decode(&shadowDB) != nil ||
 		d.Decode(&shardStatus) != nil ||
 		d.Decode(&lastOps) != nil ||
 		d.Decode(&config) != nil ||
-		d.Decode(&lastConfig) != nil {
+		d.Decode(&lastConfig) != nil ||
+		d.Decode(&coordTxns) != nil ||
+		d.Decode(&branchTxns) != nil ||
+		d.Decode(&preparedKeys) != nil {
 		log.Fatal("ReadSnapshot decode error")
 	} else {
 		kv.snapshotRefsWG.Wait()
@@ -1333,6 +2105,25 @@ func (kv *ShardKV) readSnapshot(data []byte) {
 		kv.lastOps = lastOps
 		kv.config = config
 		kv.lastConfig = lastConfig
+		if coordTxns == nil {
+			coordTxns = make(map[uint64]CoordTxnRecord)
+		}
+		if branchTxns == nil {
+			branchTxns = make(map[uint64]BranchTxnRecord)
+		}
+		if preparedKeys == nil {
+			preparedKeys = make(map[string]uint64)
+		}
+		kv.coordTxns = coordTxns
+		kv.branchTxns = branchTxns
+		kv.preparedKeys = preparedKeys
+		kv.activeTxn = make(map[uint64]uint64)
+		kv.activeTxnLast = make(map[uint64]time.Time)
+		now := time.Now()
+		for txnID, rec := range branchTxns {
+			kv.activeTxn[txnID] = rec.Snapshot
+			kv.activeTxnLast[txnID] = now
+		}
 	}
 }
 
@@ -1360,6 +2151,13 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(TxnRead{})
 	labgob.Register([]TxnWrite{})
 	labgob.Register([]TxnRead{})
+	labgob.Register(CoordTxnParticipant{})
+	labgob.Register(CoordTxnBranchRecord{})
+	labgob.Register(CoordTxnRecord{})
+	labgob.Register(BranchTxnRecord{})
+	labgob.Register(map[uint64]CoordTxnRecord{})
+	labgob.Register(map[uint64]BranchTxnRecord{})
+	labgob.Register(map[string]uint64{})
 	labgob.Register(KeyValue{})
 	labgob.Register([]KeyValue{})
 	labgob.Register(TxnRangeKV{})
@@ -1385,6 +2183,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.waitCh = make(map[int]chan OpResult)
 	kv.activeTxn = make(map[uint64]uint64)
 	kv.activeTxnLast = make(map[uint64]time.Time)
+	kv.coordTxns = make(map[uint64]CoordTxnRecord)
+	kv.branchTxns = make(map[uint64]BranchTxnRecord)
+	kv.preparedKeys = make(map[string]uint64)
 	kv.snapshotNotify = make(chan struct{}, 1)
 	kv.snapshotStop = make(chan struct{})
 
@@ -1397,6 +2198,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.monitorMigration()
 	go kv.monitorGC()
 	go kv.monitorTxnGC()
+	go kv.monitorTxnRecovery()
 
 	return kv
 }

@@ -24,6 +24,7 @@ type ShardKVClient interface {
 	TxnBegin(ctx context.Context, in *TxnBeginRequest, opts ...grpc.CallOption) (*TxnBeginResponse, error)
 	TxnGet(ctx context.Context, in *TxnGetRequest, opts ...grpc.CallOption) (*TxnGetResponse, error)
 	TxnRange(ctx context.Context, in *TxnRangeRequest, opts ...grpc.CallOption) (*TxnRangeResponse, error)
+	TxnAbort(ctx context.Context, in *TxnGetRequest, opts ...grpc.CallOption) (*TxnCommitResponse, error)
 	TxnCommit(ctx context.Context, in *TxnCommitRequest, opts ...grpc.CallOption) (*TxnCommitResponse, error)
 }
 
@@ -98,6 +99,15 @@ func (c *shardKVClient) TxnRange(ctx context.Context, in *TxnRangeRequest, opts 
 	return out, nil
 }
 
+func (c *shardKVClient) TxnAbort(ctx context.Context, in *TxnGetRequest, opts ...grpc.CallOption) (*TxnCommitResponse, error) {
+	out := new(TxnCommitResponse)
+	err := c.cc.Invoke(ctx, "/shardkvpb.ShardKV/TxnAbort", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *shardKVClient) TxnCommit(ctx context.Context, in *TxnCommitRequest, opts ...grpc.CallOption) (*TxnCommitResponse, error) {
 	out := new(TxnCommitResponse)
 	err := c.cc.Invoke(ctx, "/shardkvpb.ShardKV/TxnCommit", in, out, opts...)
@@ -118,6 +128,7 @@ type ShardKVServer interface {
 	TxnBegin(context.Context, *TxnBeginRequest) (*TxnBeginResponse, error)
 	TxnGet(context.Context, *TxnGetRequest) (*TxnGetResponse, error)
 	TxnRange(context.Context, *TxnRangeRequest) (*TxnRangeResponse, error)
+	TxnAbort(context.Context, *TxnGetRequest) (*TxnCommitResponse, error)
 	TxnCommit(context.Context, *TxnCommitRequest) (*TxnCommitResponse, error)
 	mustEmbedUnimplementedShardKVServer()
 }
@@ -146,6 +157,9 @@ func (UnimplementedShardKVServer) TxnGet(context.Context, *TxnGetRequest) (*TxnG
 }
 func (UnimplementedShardKVServer) TxnRange(context.Context, *TxnRangeRequest) (*TxnRangeResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method TxnRange not implemented")
+}
+func (UnimplementedShardKVServer) TxnAbort(context.Context, *TxnGetRequest) (*TxnCommitResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method TxnAbort not implemented")
 }
 func (UnimplementedShardKVServer) TxnCommit(context.Context, *TxnCommitRequest) (*TxnCommitResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method TxnCommit not implemented")
@@ -289,6 +303,24 @@ func _ShardKV_TxnRange_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ShardKV_TxnAbort_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TxnGetRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShardKVServer).TxnAbort(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/shardkvpb.ShardKV/TxnAbort",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShardKVServer).TxnAbort(ctx, req.(*TxnGetRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ShardKV_TxnCommit_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(TxnCommitRequest)
 	if err := dec(in); err != nil {
@@ -338,6 +370,10 @@ var _ShardKV_serviceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "TxnRange",
 			Handler:    _ShardKV_TxnRange_Handler,
+		},
+		{
+			MethodName: "TxnAbort",
+			Handler:    _ShardKV_TxnAbort_Handler,
 		},
 		{
 			MethodName: "TxnCommit",

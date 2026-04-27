@@ -135,6 +135,7 @@ type Txn struct {
 	txnID     uint64
 	snapshot  uint64
 	shard     int
+	beginKey  string
 	isolation shardkv.IsolationLevel
 
 	writes  map[string]*string
@@ -177,6 +178,7 @@ func (c *Client) BeginTxn(level shardkv.IsolationLevel, keyHint string) (*Txn, s
 		txnID:     resp.TxnId,
 		snapshot:  resp.Snapshot,
 		shard:     shardkv.Key2ShardForExternal(keyHint),
+		beginKey:  keyHint,
 		isolation: level,
 		writes:    make(map[string]*string),
 		reads:     make(map[string]uint64),
@@ -310,10 +312,39 @@ func (tx *Txn) Range(start, end string, limit int) ([]shardkv.KeyValue, bool) {
 	return out, true
 }
 
+func (tx *Txn) finish() {
+	tx.writes = make(map[string]*string)
+	tx.reads = make(map[string]uint64)
+	tx.txnID = 0
+	tx.snapshot = 0
+	tx.beginKey = ""
+	tx.invalid = true
+}
+
+// Abort explicitly releases the remote transaction context.
+func (tx *Txn) Abort() {
+	if tx.txnID == 0 {
+		tx.finish()
+		return
+	}
+	ctx, cancel := tx.c.ctx()
+	defer cancel()
+	_, _ = tx.c.cli.TxnAbort(ctx, &shardkvpb.TxnGetRequest{
+		Key:   tx.beginKey,
+		TxnId: tx.txnID,
+	})
+	tx.finish()
+}
+
 // Commit submits the transaction.
 func (tx *Txn) Commit() bool {
 	if tx.invalid {
+		tx.Abort()
 		return false
+	}
+	if len(tx.writes) == 0 && len(tx.reads) == 0 {
+		tx.Abort()
+		return true
 	}
 	writes := make([]*shardkvpb.TxnWrite, 0, len(tx.writes))
 	for k, v := range tx.writes {
@@ -337,8 +368,10 @@ func (tx *Txn) Commit() bool {
 		Reads:     reads,
 	})
 	if err != nil {
+		tx.finish()
 		return false
 	}
 	e := parseErr(resp.Err)
+	tx.finish()
 	return e == shardkv.OK
 }
