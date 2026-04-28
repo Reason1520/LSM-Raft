@@ -24,6 +24,8 @@ const (
 	TxnGCInterval        = 500 * time.Millisecond
 	TxnTTL               = 30 * time.Second
 	TxnRecoveryInterval  = 200 * time.Millisecond
+	WriteBatchWindow     = 200 * time.Microsecond
+	WriteBatchMax        = 32
 )
 
 const (
@@ -34,38 +36,45 @@ const (
 )
 
 type Op struct {
-	Type       string // "Get", "Put", "Append", "Reconfig", "InsertShard", "DeleteShard"
-	Key        string
-	Value      string
-	RangeStart string
-	RangeEnd   string
-	RangeLimit int
-	ClientID   int64
-	RPCID      int64
-	TxnID      uint64
-	Writes     []TxnWrite
-	Reads      []TxnRead
-	Isolation  IsolationLevel
-	Config     shardctrler.Config
-	ShardData  map[string]string
-	LastOpMap  map[int64]OpResult
-	GID        int
-	ShardID    int
-	ConfigNum  int
-	CoordGID   int
-	Snapshot   uint64
+	Type        string // "Get", "Put", "Append", "Reconfig", "InsertShard", "DeleteShard"
+	Key         string
+	Value       string
+	RangeStart  string
+	RangeEnd    string
+	RangeLimit  int
+	ClientID    int64
+	RPCID       int64
+	TxnID       uint64
+	Writes      []TxnWrite
+	Reads       []TxnRead
+	Isolation   IsolationLevel
+	Config      shardctrler.Config
+	ShardData   map[string]string
+	LastOpMap   map[int64]OpResult
+	GID         int
+	ShardID     int
+	ConfigNum   int
+	CoordGID    int
+	Snapshot    uint64
+	BatchWrites []BatchedWrite
 }
 
 type OpResult struct {
-	Err       Err
-	Value     string
-	KVs       []KeyValue
-	RPCID     int64
-	TxnID     uint64
-	Snapshot  uint64
-	ConfigNum int
-	GID       int
-	ShardID   int
+	Err          Err
+	Value        string
+	KVs          []KeyValue
+	RPCID        int64
+	TxnID        uint64
+	Snapshot     uint64
+	ConfigNum    int
+	GID          int
+	ShardID      int
+	BatchResults []OpResult
+}
+
+type pendingWriteReq struct {
+	write  BatchedWrite
+	replyC chan OpResult
 }
 
 type ShardKV struct {
@@ -97,6 +106,7 @@ type ShardKV struct {
 	proposalTraces map[int]proposalTrace
 	applyNotify    chan struct{}
 	metrics        *shardKVMetrics
+	writeBatchCh   chan pendingWriteReq
 
 	nextTxnID         uint64
 	nextInternalRPCID int64
@@ -359,15 +369,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 	kv.mu.Unlock()
 
-	op := Op{
+	res := kv.submitBatchedWrite(BatchedWrite{
 		Type:     args.Op,
 		Key:      args.Key,
 		Value:    args.Value,
 		ClientID: args.ClientID,
 		RPCID:    args.RPCID,
-	}
-
-	res := kv.startOp(op)
+	})
 	reply.Err = res.Err
 }
 
@@ -862,6 +870,85 @@ func (kv *ShardKV) startOp(op Op) OpResult {
 	}
 }
 
+func (kv *ShardKV) submitBatchedWrite(write BatchedWrite) OpResult {
+	req := pendingWriteReq{
+		write:  write,
+		replyC: make(chan OpResult, 1),
+	}
+
+	select {
+	case kv.writeBatchCh <- req:
+	case <-time.After(500 * time.Millisecond):
+		return OpResult{Err: ErrTimeout, RPCID: write.RPCID}
+	}
+
+	select {
+	case res := <-req.replyC:
+		return res
+	case <-time.After(500 * time.Millisecond):
+		return OpResult{Err: ErrTimeout, RPCID: write.RPCID}
+	}
+}
+
+func (kv *ShardKV) writeBatcher() {
+	for !kv.killed() {
+		var first pendingWriteReq
+		select {
+		case first = <-kv.writeBatchCh:
+		case <-time.After(50 * time.Millisecond):
+			continue
+		}
+
+		batch := make([]pendingWriteReq, 0, WriteBatchMax)
+		batch = append(batch, first)
+		timer := time.NewTimer(WriteBatchWindow)
+
+	collect:
+		for len(batch) < WriteBatchMax {
+			select {
+			case req := <-kv.writeBatchCh:
+				batch = append(batch, req)
+			case <-timer.C:
+				break collect
+			}
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+
+		writes := make([]BatchedWrite, 0, len(batch))
+		for _, req := range batch {
+			writes = append(writes, req.write)
+		}
+
+		res := kv.startOp(Op{
+			Type:        PUTAPPENDBATCH,
+			BatchWrites: writes,
+		})
+
+		if res.Err != OK && res.Err != ErrRepeated {
+			for _, req := range batch {
+				req.replyC <- OpResult{Err: res.Err, RPCID: req.write.RPCID}
+			}
+			continue
+		}
+
+		if len(res.BatchResults) != len(batch) {
+			for _, req := range batch {
+				req.replyC <- OpResult{Err: ErrTimeout, RPCID: req.write.RPCID}
+			}
+			continue
+		}
+
+		for i, req := range batch {
+			req.replyC <- res.BatchResults[i]
+		}
+	}
+}
+
 // PullData handles shard data pull requests from other groups.
 func (kv *ShardKV) PullData(args *PullDataArgs, reply *PullDataReply) {
 	if _, isLeader := kv.rf.GetState(); !isLeader {
@@ -949,6 +1036,8 @@ func (kv *ShardKV) applier() {
 			switch op.Type {
 			case PUT, APPEND:
 				res = kv.applyPutAppend(op, index)
+			case PUTAPPENDBATCH:
+				res = kv.applyPutAppendBatch(op, index)
 			case GET:
 				res = kv.applyGet(op)
 			case RANGE:
@@ -1002,9 +1091,17 @@ func (kv *ShardKV) applier() {
 					commitAt := time.Unix(0, msg.CommitTime)
 					startToCommit := commitAt.Sub(trace.startedAt)
 					commitToApply := time.Since(commitAt)
-					if (op.Type == PUT || op.Type == APPEND) && startToCommit >= 0 {
-						kv.metrics.observePutRaftCommit(startToCommit)
-						kv.metrics.observePutApplyWait(commitToApply)
+					if startToCommit >= 0 {
+						switch op.Type {
+						case PUT, APPEND:
+							kv.metrics.observePutRaftCommit(startToCommit)
+							kv.metrics.observePutApplyWait(commitToApply)
+						case PUTAPPENDBATCH:
+							for range op.BatchWrites {
+								kv.metrics.observePutRaftCommit(startToCommit)
+								kv.metrics.observePutApplyWait(commitToApply)
+							}
+						}
 					}
 				}
 				delete(kv.proposalTraces, index)
@@ -1064,6 +1161,21 @@ func (kv *ShardKV) applyPutAppend(op Op, index int) OpResult {
 	res := OpResult{Err: OK, RPCID: op.RPCID}
 	kv.lastOps[op.ClientID] = res
 	return res
+}
+
+func (kv *ShardKV) applyPutAppendBatch(op Op, index int) OpResult {
+	results := make([]OpResult, 0, len(op.BatchWrites))
+	for _, item := range op.BatchWrites {
+		subOp := Op{
+			Type:     item.Type,
+			Key:      item.Key,
+			Value:    item.Value,
+			ClientID: item.ClientID,
+			RPCID:    item.RPCID,
+		}
+		results = append(results, kv.applyPutAppend(subOp, index))
+	}
+	return OpResult{Err: OK, BatchResults: results}
 }
 
 func (kv *ShardKV) applyGet(op Op) OpResult {
@@ -2250,6 +2362,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Op{})
 	labgob.Register(shardctrler.Config{})
 	labgob.Register(OpResult{})
+	labgob.Register(BatchedWrite{})
+	labgob.Register([]BatchedWrite{})
+	labgob.Register([]OpResult{})
 	labgob.Register(map[string]string{})
 	labgob.Register(map[int64]OpResult{})
 	labgob.Register(TxnWrite{})
@@ -2290,6 +2405,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.proposalTraces = make(map[int]proposalTrace)
 	kv.applyNotify = make(chan struct{}, 1)
 	kv.metrics = &shardKVMetrics{}
+	kv.writeBatchCh = make(chan pendingWriteReq, 1024)
 	kv.activeTxn = make(map[uint64]uint64)
 	kv.activeTxnLast = make(map[uint64]time.Time)
 	kv.coordTxns = make(map[uint64]CoordTxnRecord)
@@ -2308,6 +2424,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	go kv.monitorGC()
 	go kv.monitorTxnGC()
 	go kv.monitorTxnRecovery()
+	go kv.writeBatcher()
 
 	return kv
 }

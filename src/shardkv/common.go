@@ -25,6 +25,7 @@ const (
 	GET              = "Get"
 	PUT              = "Put"
 	APPEND           = "Append"
+	PUTAPPENDBATCH   = "PutAppendBatch"
 	RANGE            = "Range"
 	RECONFIG         = "Reconfig"
 	INSERTSHARD      = "InsertShard"
@@ -70,6 +71,14 @@ type PutAppendArgs struct {
 
 type PutAppendReply struct {
 	Err Err
+}
+
+type BatchedWrite struct {
+	Type     string
+	Key      string
+	Value    string
+	ClientID int64
+	RPCID    int64
 }
 
 type GetArgs struct {

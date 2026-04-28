@@ -98,6 +98,17 @@ type Snapshot struct {
 	Data              []byte // 快照数据
 }
 
+type preparedPersist struct {
+	seq               uint64
+	currentTerm       int
+	votedFor          int
+	log               []LogEntry
+	lastIncludedIndex int
+	lastIncludedTerm  int
+	persistSnapshot   bool
+	snapshot          []byte
+}
+
 // Raft : A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex // Lock to protect shared access to this peer's state
@@ -133,6 +144,10 @@ type Raft struct {
 	peerAckTerm []int
 	peerAckTime []time.Time
 	commitTimes map[int]int64
+	persistMu   sync.Mutex
+	persistCond *sync.Cond
+	persistSeq  uint64
+	persistDone uint64
 
 	persistCount                uint64
 	persistTimeNS               uint64
@@ -178,12 +193,54 @@ func (rf *Raft) GetState() (int, bool) {
 // (or nil if there's not yet a snapshot).
 
 func (rf *Raft) persist(persistSnapshot bool, snapshot []byte) {
-	start := time.Now()
-	if persistSnapshot {
-		rf.persister.Save(rf.encodeState(), snapshot)
-	} else {
-		rf.persister.SaveRaftState(rf.encodeState())
+	ps := rf.preparePersistLocked(persistSnapshot, snapshot)
+	rf.commitPreparedPersist(ps)
+}
+
+func (rf *Raft) preparePersistLocked(persistSnapshot bool, snapshot []byte) preparedPersist {
+	logCopy := append([]LogEntry(nil), rf.log...)
+	ps := preparedPersist{
+		seq:               rf.persistSeq + 1,
+		currentTerm:       rf.currentTerm,
+		votedFor:          rf.votedFor,
+		log:               logCopy,
+		lastIncludedIndex: rf.lastIncludedIndex,
+		lastIncludedTerm:  rf.lastIncludedTerm,
+		persistSnapshot:   persistSnapshot,
+		snapshot:          snapshot,
 	}
+	rf.persistSeq++
+	return ps
+}
+
+func encodePreparedPersist(ps preparedPersist) []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(ps.currentTerm)
+	e.Encode(ps.votedFor)
+	e.Encode(ps.log)
+	e.Encode(ps.lastIncludedIndex)
+	e.Encode(ps.lastIncludedTerm)
+	return w.Bytes()
+}
+
+func (rf *Raft) commitPreparedPersist(ps preparedPersist) {
+	start := time.Now()
+	state := encodePreparedPersist(ps)
+
+	rf.persistMu.Lock()
+	for rf.persistDone+1 != ps.seq {
+		rf.persistCond.Wait()
+	}
+	if ps.persistSnapshot {
+		rf.persister.Save(state, ps.snapshot)
+	} else {
+		rf.persister.SaveRaftState(state)
+	}
+	rf.persistDone = ps.seq
+	rf.persistCond.Broadcast()
+	rf.persistMu.Unlock()
+
 	rf.observePersist(time.Since(start))
 }
 
@@ -446,12 +503,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}()
 	}
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
+	needPersist := false
+	logPersist := false
+	unlockAndPersist := func() {
+		var ps *preparedPersist
+		if needPersist {
+			tmp := rf.preparePersistLocked(false, nil)
+			ps = &tmp
+		}
+		rf.mu.Unlock()
+		if ps != nil {
+			persistStart := time.Now()
+			rf.commitPreparedPersist(*ps)
+			if logPersist {
+				rf.observeFollowerAppendPersist(time.Since(persistStart))
+			}
+		}
+	}
 
 	// 如果领导者任期小于当前任期，拒绝
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		unlockAndPersist()
 		return
 	}
 
@@ -463,7 +537,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 		rf.role = FOLLOWER
-		rf.persist(false, nil)
+		needPersist = true
 	}
 	if rf.role != FOLLOWER {
 		rf.role = FOLLOWER
@@ -480,6 +554,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XTerm = -1
 		reply.XLen = lastIndex + 1
 		reply.XIndex = -1
+		unlockAndPersist()
 		return
 	}
 
@@ -505,6 +580,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.XIndex = rf.lastIncludedIndex + idx
 		}
 		reply.XLen = lastIndex + 1
+		unlockAndPersist()
 		return
 	}
 
@@ -554,9 +630,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if conflictFound {
 		rf.log = append(rf.log, args.Entries[startAppendIdx:]...)
-		persistStart := time.Now()
-		rf.persist(false, nil)
-		rf.observeFollowerAppendPersist(time.Since(persistStart))
+		needPersist = true
+		logPersist = true
 	}
 
 	// 修改commitIndex
@@ -565,6 +640,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = min(args.LeaderCommit, lastNewIndex)
 		rf.applyCond.Broadcast()
 	}
+	unlockAndPersist()
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -920,12 +996,12 @@ func (rf *Raft) replicator(server int) {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	start := time.Now()
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	defer func() {
 		rf.observeStart(time.Since(start))
 	}()
 
 	if rf.role != LEADER {
+		rf.mu.Unlock()
 		return -1, -1, false
 	}
 
@@ -939,9 +1015,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command:   command,
 		TimeStamp: time.Now().UnixNano(),
 	})
-	persistStart := time.Now()
-	rf.persist(false, nil)
-	rf.observeLeaderPersist(time.Since(persistStart))
+	ps := rf.preparePersistLocked(false, nil)
 
 	// Single-node cluster: commit immediately.
 	if len(rf.peers) == 1 {
@@ -953,6 +1027,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.commitIndex = index
 		rf.applyCond.Broadcast()
 	}
+	rf.mu.Unlock()
+	persistStart := time.Now()
+	rf.commitPreparedPersist(ps)
+	rf.observeLeaderPersist(time.Since(persistStart))
 
 	// 立即发送心跳
 	rf.broadcastAppendEntries(true)
@@ -1215,6 +1293,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.readCond = sync.NewCond(&rf.mu)
+	rf.persistCond = sync.NewCond(&rf.persistMu)
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.currentTerm = 0
