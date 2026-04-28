@@ -22,6 +22,8 @@ package raft
 
 import (
 	"bytes"
+	"encoding/binary"
+	"io"
 	"math/rand"
 
 	//"runtime/debug"
@@ -70,6 +72,8 @@ var PRINTINF = false // 打印信息
 
 const leaderLeaseTimeout = 150 * time.Millisecond
 
+var persistMagic = [4]byte{'R', 'F', 'T', '2'}
+
 // ApplyMsg : 当日志条目被commit，该服务器会向m.applyCh发送一个ApplyMsg
 type ApplyMsg struct {
 	CommandValid bool
@@ -98,11 +102,19 @@ type Snapshot struct {
 	Data              []byte // 快照数据
 }
 
+type persistedState struct {
+	CurrentTerm       int
+	VotedFor          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	EncodedLog        [][]byte
+}
+
 type preparedPersist struct {
 	seq               uint64
 	currentTerm       int
 	votedFor          int
-	log               []LogEntry
+	encodedLog        [][]byte
 	lastIncludedIndex int
 	lastIncludedTerm  int
 	persistSnapshot   bool
@@ -144,6 +156,7 @@ type Raft struct {
 	peerAckTerm []int
 	peerAckTime []time.Time
 	commitTimes map[int]int64
+	encodedLog  [][]byte
 	persistMu   sync.Mutex
 	persistCond *sync.Cond
 	persistSeq  uint64
@@ -198,12 +211,12 @@ func (rf *Raft) persist(persistSnapshot bool, snapshot []byte) {
 }
 
 func (rf *Raft) preparePersistLocked(persistSnapshot bool, snapshot []byte) preparedPersist {
-	logCopy := append([]LogEntry(nil), rf.log...)
+	encodedCopy := append([][]byte(nil), rf.encodedLog...)
 	ps := preparedPersist{
 		seq:               rf.persistSeq + 1,
 		currentTerm:       rf.currentTerm,
 		votedFor:          rf.votedFor,
-		log:               logCopy,
+		encodedLog:        encodedCopy,
 		lastIncludedIndex: rf.lastIncludedIndex,
 		lastIncludedTerm:  rf.lastIncludedTerm,
 		persistSnapshot:   persistSnapshot,
@@ -214,14 +227,13 @@ func (rf *Raft) preparePersistLocked(persistSnapshot bool, snapshot []byte) prep
 }
 
 func encodePreparedPersist(ps preparedPersist) []byte {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(ps.currentTerm)
-	e.Encode(ps.votedFor)
-	e.Encode(ps.log)
-	e.Encode(ps.lastIncludedIndex)
-	e.Encode(ps.lastIncludedTerm)
-	return w.Bytes()
+	return encodePersistedState(persistedState{
+		CurrentTerm:       ps.currentTerm,
+		VotedFor:          ps.votedFor,
+		LastIncludedIndex: ps.lastIncludedIndex,
+		LastIncludedTerm:  ps.lastIncludedTerm,
+		EncodedLog:        ps.encodedLog,
+	})
 }
 
 func (rf *Raft) commitPreparedPersist(ps preparedPersist) {
@@ -248,6 +260,55 @@ func (rf *Raft) commitPreparedPersist(ps preparedPersist) {
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
+	}
+	{
+		if ps, ok := decodePersistedState(data); ok && len(ps.EncodedLog) > 0 {
+			logs := make([]LogEntry, len(ps.EncodedLog))
+			for i, buf := range ps.EncodedLog {
+				entry, ok := decodeLogEntry(buf)
+				if !ok {
+					logs = nil
+					break
+				}
+				logs[i] = entry
+			}
+			if len(logs) > 0 {
+				rf.currentTerm = ps.CurrentTerm
+				rf.votedFor = ps.VotedFor
+				rf.log = logs
+				rf.encodedLog = append([][]byte(nil), ps.EncodedLog...)
+				rf.lastIncludedIndex = ps.LastIncludedIndex
+				rf.lastIncludedTerm = ps.LastIncludedTerm
+				rf.commitIndex = ps.LastIncludedIndex
+				rf.lastApplied = ps.LastIncludedIndex
+				return
+			}
+		}
+		r := bytes.NewBuffer(data)
+		d := labgob.NewDecoder(r)
+		var ps persistedState
+		if d.Decode(&ps) == nil && len(ps.EncodedLog) > 0 {
+			logs := make([]LogEntry, len(ps.EncodedLog))
+			for i, buf := range ps.EncodedLog {
+				entry, ok := decodeLogEntry(buf)
+				if !ok {
+					logs = nil
+					break
+				}
+				logs[i] = entry
+			}
+			if len(logs) > 0 {
+				rf.currentTerm = ps.CurrentTerm
+				rf.votedFor = ps.VotedFor
+				rf.log = logs
+				rf.encodedLog = append([][]byte(nil), ps.EncodedLog...)
+				rf.lastIncludedIndex = ps.LastIncludedIndex
+				rf.lastIncludedTerm = ps.LastIncludedTerm
+				rf.commitIndex = ps.LastIncludedIndex
+				rf.lastApplied = ps.LastIncludedIndex
+				return
+			}
+		}
 	}
 	// Your code here (3C).
 	// 创建解码器
@@ -277,6 +338,13 @@ func (rf *Raft) readPersist(data []byte) {
 			rf.log = []LogEntry{{Term: lastIncludedTerm, Command: nil}} // Command 默认为 nil
 		} else {
 			rf.log = log
+		}
+		if len(rf.log) == 0 {
+			rf.log = []LogEntry{{Term: lastIncludedTerm, Command: nil}}
+		}
+		rf.encodedLog = make([][]byte, len(rf.log))
+		for i, entry := range rf.log {
+			rf.encodedLog[i] = mustEncodeLogEntry(entry)
 		}
 		rf.lastIncludedIndex = lastIncludedIndex
 		rf.lastIncludedTerm = lastIncludedTerm
@@ -313,9 +381,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	newLog := make([]LogEntry, 0, len(rf.log)-sliceIndex)
 	newLog = append(newLog, rf.log[sliceIndex:]...)
 	rf.log = newLog
+	newEncoded := make([][]byte, 0, len(rf.encodedLog)-sliceIndex)
+	newEncoded = append(newEncoded, rf.encodedLog[sliceIndex:]...)
+	rf.encodedLog = newEncoded
 
 	// 清理哨兵
 	rf.log[0].Command = nil
+	rf.encodedLog[0] = mustEncodeLogEntry(rf.log[0])
 
 	rf.persist(true, snapshot)
 }
@@ -372,9 +444,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if indexInLog > 0 && indexInLog < len(rf.log) && rf.log[indexInLog].Term == args.LastIncludedTerm {
 		// 如果切片的索引和任期与log[]中的某个日志都匹配，则从该索引开始截断日志
 		rf.log = rf.log[indexInLog:]
+		rf.encodedLog = rf.encodedLog[indexInLog:]
 	} else {
 		// 否则，从log[]的开头开始截断日志
 		rf.log = make([]LogEntry, 1)
+		rf.encodedLog = make([][]byte, 1)
 		rf.log[0].Term = args.LastIncludedTerm
 	}
 
@@ -382,6 +456,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lastIncludedTerm = args.LastIncludedTerm
 	rf.log[0].Term = args.LastIncludedTerm
 	rf.log[0].Command = nil
+	rf.encodedLog[0] = mustEncodeLogEntry(rf.log[0])
 
 	// 默认切片内容已提交
 	if args.LastIncludedIndex > rf.commitIndex {
@@ -395,14 +470,19 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 }
 
 func (rf *Raft) encodeState() []byte {
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	e.Encode(rf.currentTerm)
-	e.Encode(rf.votedFor)
-	e.Encode(rf.log)
-	e.Encode(rf.lastIncludedIndex)
-	e.Encode(rf.lastIncludedTerm)
-	return w.Bytes()
+	if len(rf.encodedLog) != len(rf.log) {
+		rf.encodedLog = make([][]byte, len(rf.log))
+		for i, entry := range rf.log {
+			rf.encodedLog[i] = mustEncodeLogEntry(entry)
+		}
+	}
+	return encodePersistedState(persistedState{
+		CurrentTerm:       rf.currentTerm,
+		VotedFor:          rf.votedFor,
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm:  rf.lastIncludedTerm,
+		EncodedLog:        append([][]byte(nil), rf.encodedLog...),
+	})
 }
 
 // RequestVoteArgs : 投票请求参数 example RequestVote RPC arguments structure.
@@ -622,6 +702,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if rf.log[sliceIdx].Term != entry.Term {
 			// 如果有冲突，先截断再添加
 			rf.log = rf.log[:sliceIdx]
+			rf.encodedLog = rf.encodedLog[:sliceIdx]
 			startAppendIdx = i
 			conflictFound = true
 			break
@@ -629,7 +710,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if conflictFound {
-		rf.log = append(rf.log, args.Entries[startAppendIdx:]...)
+		rf.appendLogEntriesLocked(args.Entries[startAppendIdx:])
 		needPersist = true
 		logPersist = true
 	}
@@ -1010,19 +1091,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := rf.currentTerm
 
 	// 添加日志
-	rf.log = append(rf.log, LogEntry{
+	entry := LogEntry{
 		Term:      term,
 		Command:   command,
 		TimeStamp: time.Now().UnixNano(),
-	})
+	}
+	rf.appendLogEntryLocked(entry)
 	ps := rf.preparePersistLocked(false, nil)
 
 	// Single-node cluster: commit immediately.
 	if len(rf.peers) == 1 {
 		commitAt := time.Now().UnixNano()
 		rf.commitTimes[index] = commitAt
-		if commitAt >= rf.log[len(rf.log)-1].TimeStamp {
-			rf.observeMajorityAck(time.Duration(commitAt - rf.log[len(rf.log)-1].TimeStamp))
+		if commitAt >= entry.TimeStamp {
+			rf.observeMajorityAck(time.Duration(commitAt - entry.TimeStamp))
 		}
 		rf.commitIndex = index
 		rf.applyCond.Broadcast()
@@ -1170,6 +1252,124 @@ func (rf *Raft) getLogTimestamp(globalIndex int) int64 {
 	return rf.log[sliceIndex].TimeStamp
 }
 
+func encodePersistedState(ps persistedState) []byte {
+	w := new(bytes.Buffer)
+	w.Write(persistMagic[:])
+	_ = binary.Write(w, binary.LittleEndian, int64(ps.CurrentTerm))
+	_ = binary.Write(w, binary.LittleEndian, int64(ps.VotedFor))
+	_ = binary.Write(w, binary.LittleEndian, int64(ps.LastIncludedIndex))
+	_ = binary.Write(w, binary.LittleEndian, int64(ps.LastIncludedTerm))
+	_ = binary.Write(w, binary.LittleEndian, uint64(len(ps.EncodedLog)))
+	for _, entry := range ps.EncodedLog {
+		_ = binary.Write(w, binary.LittleEndian, uint64(len(entry)))
+		w.Write(entry)
+	}
+	return w.Bytes()
+}
+
+func decodePersistedState(data []byte) (persistedState, bool) {
+	var ps persistedState
+	if len(data) < len(persistMagic) || !bytes.Equal(data[:len(persistMagic)], persistMagic[:]) {
+		return ps, false
+	}
+
+	r := bytes.NewReader(data[len(persistMagic):])
+	var currentTerm int64
+	var votedFor int64
+	var lastIncludedIndex int64
+	var lastIncludedTerm int64
+	var count uint64
+	if binary.Read(r, binary.LittleEndian, &currentTerm) != nil ||
+		binary.Read(r, binary.LittleEndian, &votedFor) != nil ||
+		binary.Read(r, binary.LittleEndian, &lastIncludedIndex) != nil ||
+		binary.Read(r, binary.LittleEndian, &lastIncludedTerm) != nil ||
+		binary.Read(r, binary.LittleEndian, &count) != nil {
+		return persistedState{}, false
+	}
+
+	ps = persistedState{
+		CurrentTerm:       int(currentTerm),
+		VotedFor:          int(votedFor),
+		LastIncludedIndex: int(lastIncludedIndex),
+		LastIncludedTerm:  int(lastIncludedTerm),
+		EncodedLog:        make([][]byte, count),
+	}
+	for i := uint64(0); i < count; i++ {
+		var size uint64
+		if binary.Read(r, binary.LittleEndian, &size) != nil {
+			return persistedState{}, false
+		}
+		buf := make([]byte, size)
+		if _, err := io.ReadFull(r, buf); err != nil {
+			return persistedState{}, false
+		}
+		ps.EncodedLog[i] = buf
+	}
+	return ps, true
+}
+
+func mustEncodeLogEntry(entry LogEntry) []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(entry) != nil {
+		panic("encode log entry failed")
+	}
+	return w.Bytes()
+}
+
+func decodeLogEntry(data []byte) (LogEntry, bool) {
+	var entry LogEntry
+	if len(data) == 0 {
+		return entry, false
+	}
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	if d.Decode(&entry) != nil {
+		return LogEntry{}, false
+	}
+	return entry, true
+}
+
+func (rf *Raft) ensureLogCapacityLocked(extra int) {
+	need := len(rf.log) + extra
+	if need <= cap(rf.log) && need <= cap(rf.encodedLog) {
+		return
+	}
+
+	newCap := cap(rf.log)
+	if newCap < 1 {
+		newCap = 1
+	}
+	for newCap < need {
+		newCap *= 2
+	}
+
+	newLog := make([]LogEntry, len(rf.log), newCap)
+	copy(newLog, rf.log)
+	rf.log = newLog
+
+	newEncoded := make([][]byte, len(rf.encodedLog), newCap)
+	copy(newEncoded, rf.encodedLog)
+	rf.encodedLog = newEncoded
+}
+
+func (rf *Raft) appendLogEntryLocked(entry LogEntry) {
+	rf.ensureLogCapacityLocked(1)
+	rf.log = append(rf.log, entry)
+	rf.encodedLog = append(rf.encodedLog, mustEncodeLogEntry(entry))
+}
+
+func (rf *Raft) appendLogEntriesLocked(entries []LogEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	rf.ensureLogCapacityLocked(len(entries))
+	for _, entry := range entries {
+		rf.log = append(rf.log, entry)
+		rf.encodedLog = append(rf.encodedLog, mustEncodeLogEntry(entry))
+	}
+}
+
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -1304,6 +1504,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		Command:   nil,
 		TimeStamp: time.Now().UnixNano(),
 	}
+	rf.encodedLog = make([][]byte, 1)
+	rf.encodedLog[0] = mustEncodeLogEntry(rf.log[0])
 	rf.applyChannel = applyCh
 
 	rf.role = FOLLOWER
