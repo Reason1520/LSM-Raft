@@ -35,49 +35,76 @@ const (
 	GCing            // waiting for GC
 )
 
+// Op 是写入 Raft 日志的统一命令载体。
+// 普通 KV、范围读、配置变更、分片迁移、单分片事务和跨分片 2PC 都复用这个结构，
+// 具体哪些字段有效由 Type 决定。
 type Op struct {
-	Type        string // "Get", "Put", "Append", "Reconfig", "InsertShard", "DeleteShard"
-	Key         string
-	Value       string
-	RangeStart  string
-	RangeEnd    string
-	RangeLimit  int
-	ClientID    int64
-	RPCID       int64
-	TxnID       uint64
-	Writes      []TxnWrite
-	Reads       []TxnRead
-	Isolation   IsolationLevel
-	Config      shardctrler.Config
-	ShardData   map[string]string
-	LastOpMap   map[int64]OpResult
-	GID         int
-	ShardID     int
-	ConfigNum   int
-	CoordGID    int
-	Snapshot    uint64
+	Type string // 操作类型，例如 Get/Put/Reconfig/TXNCOORDBEGIN/TXNBRANCHCOMMIT。
+
+	// 普通 KV 与 Range 请求字段。
+	Key        string
+	Value      string
+	RangeStart string
+	RangeEnd   string
+	RangeLimit int
+
+	// 客户端幂等字段，用于 lastOps 去重和返回同一个 RPC 的历史结果。
+	ClientID int64
+	RPCID    int64
+
+	// 事务字段：TxnID 标识事务，Reads/Writes 是提交或 prepare 时携带的读写集。
+	TxnID     uint64
+	Writes    []TxnWrite
+	Reads     []TxnRead
+	Isolation IsolationLevel
+
+	// 配置变更与分片迁移字段。
+	Config    shardctrler.Config
+	ShardData map[string]string
+	LastOpMap map[int64]OpResult
+
+	// 跨分片事务与分片定位字段。
+	GID       int
+	ShardID   int
+	ConfigNum int
+	CoordGID  int
+	Snapshot  uint64
+
+	// 批量写请求字段，多个 Put/Append 可以合并成一条 Raft 日志。
 	BatchWrites []BatchedWrite
 }
 
+// OpResult 是 apply 后返回给 RPC handler 的结果。
+// 它既承载业务返回值，也承载事务 begin、branch begin 等内部状态返回值。
 type OpResult struct {
-	Err          Err
-	Value        string
-	KVs          []KeyValue
-	RPCID        int64
-	TxnID        uint64
-	Snapshot     uint64
-	ConfigNum    int
-	GID          int
-	ShardID      int
+	Err   Err
+	Value string
+	KVs   []KeyValue
+
+	// RPCID 用于和 lastOps 一起做客户端请求去重。
+	RPCID int64
+
+	// 事务/分片相关返回字段。
+	TxnID     uint64
+	Snapshot  uint64
+	ConfigNum int
+	GID       int
+	ShardID   int
+
+	// 批量写时，每个子请求各自的 apply 结果。
 	BatchResults []OpResult
 }
 
+// pendingWriteReq 是等待批量写聚合的单个写请求。
 type pendingWriteReq struct {
-	write  BatchedWrite
-	replyC chan OpResult
+	write  BatchedWrite  // 待合并的 Put/Append。
+	replyC chan OpResult // 该请求自己的结果通道。
 }
 
+// ShardKV 是一个 shard group 内的单个副本状态机。
+// 所有会影响可见状态的修改都必须通过 Raft apply 到这里。
 type ShardKV struct {
+	// 基础 Raft/服务字段。
 	mu           sync.Mutex
 	me           int
 	rf           *raft.Raft
@@ -85,22 +112,28 @@ type ShardKV struct {
 	make_end     func(string) *labrpc.ClientEnd
 	gid          int
 	ctrlers      []*labrpc.ClientEnd
-	maxraftstate int // snapshot if log grows this big
+	maxraftstate int // Raft 状态超过该阈值后触发 snapshot；-1 表示关闭。
 	dead         int32
 
+	// shardctrler 配置视图。config 是当前配置，lastConfig 用于迁移时找旧 owner。
 	mck        *shardctrler.Clerk
 	config     shardctrler.Config
 	lastConfig shardctrler.Config
 	persister  *raft.Persister
 
+	// 每个 shard 一个 LSM 引擎，只有本 group 当前持有或正在迁移处理的 shard 才会有引擎。
 	kvDB map[int]*lsm.LSMEngine
 
+	// 迁出 shard 的临时数据：configNum -> shardID -> key/value。
 	shadowDB map[int]map[int]map[string]string
 
+	// 每个 shard 的迁移状态：Serving/Pulling/BePulling/GCing。
 	shardStatus map[int]int
 
+	// 客户端请求去重表：clientID -> 该客户端最近一次 RPC 的结果。
 	lastOps map[int64]OpResult
 
+	// Raft 提案等待与 apply 通知。
 	waitCh         map[int]chan OpResult
 	readyResult    map[int]OpResult
 	proposalTraces map[int]proposalTrace
@@ -108,17 +141,20 @@ type ShardKV struct {
 	metrics        *shardKVMetrics
 	writeBatchCh   chan pendingWriteReq
 
+	// 本 group 内部分配的事务 ID/RPC ID，以及当前已 apply 到的 Raft index。
 	nextTxnID         uint64
 	nextInternalRPCID int64
 	lastApplied       int
 
-	activeTxn     map[uint64]uint64
-	activeTxnLast map[uint64]time.Time
-	gcWatermark   uint64
-	coordTxns     map[uint64]CoordTxnRecord
-	branchTxns    map[uint64]BranchTxnRecord
-	preparedKeys  map[string]uint64
+	// MVCC 与事务状态。
+	activeTxn     map[uint64]uint64          // txnID -> snapshot，用于保护旧版本不被 GC。
+	activeTxnLast map[uint64]time.Time       // txnID -> 最近活跃时间，用于事务 TTL 清理。
+	gcWatermark   uint64                     // 当前允许 LSM 回收的最小安全版本。
+	coordTxns     map[uint64]CoordTxnRecord  // 本 group 作为 coordinator 时持有的事务元数据。
+	branchTxns    map[uint64]BranchTxnRecord // 本 group 作为 participant 时持有的 branch 状态。
+	preparedKeys  map[string]uint64          // prepare 阶段的写锁：key -> txnID。
 
+	// 异步 snapshot 相关字段。
 	snapshotMu     sync.Mutex
 	pendingSnap    *snapshotTask
 	snapshotNotify chan struct{}
@@ -127,8 +163,12 @@ type ShardKV struct {
 	snapshotRefsWG sync.WaitGroup
 }
 
+// snapshotTask 是一次异步 snapshot 捕获到的状态副本。
+// worker 使用这些副本编码 snapshot，避免长时间持有 ShardKV.mu。
 type snapshotTask struct {
-	index        int
+	index int // 这次 snapshot 覆盖到的 Raft log index。
+
+	// 需要持久化的业务、迁移和事务状态。
 	engines      map[int]*lsm.LSMEngine
 	shadowDB     map[int]map[int]map[string]string
 	shardState   map[int]int
